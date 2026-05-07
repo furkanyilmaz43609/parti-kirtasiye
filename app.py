@@ -5,6 +5,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 from io import StringIO
+from zoneinfo import ZoneInfo
 
 from flask import (
     Flask,
@@ -20,6 +21,7 @@ from flask import (
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TR = ZoneInfo("Europe/Istanbul")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "pdks-local-dev-change-me")
@@ -47,6 +49,7 @@ def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DATABASE)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
 
@@ -133,8 +136,111 @@ def require_admin():
     return session.get("is_admin") is True
 
 
+def now_tr():
+    return datetime.now(TR)
+
+
 def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return now_tr().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_ts_tr(s):
+    dt = _parse_ts(s)
+    if not dt:
+        return None
+    return dt.replace(tzinfo=TR)
+
+
+def _minutes_between(start_dt, end_dt):
+    return max(0, int((end_dt - start_dt).total_seconds() // 60))
+
+
+def format_duration_tr(minutes: int | float | None) -> str:
+    if minutes is None:
+        minutes = 0
+    m = int(max(0, minutes))
+    h, mm = divmod(m, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} sa")
+    if mm:
+        parts.append(f"{mm} dk")
+    return " ".join(parts) if parts else "0 dk"
+
+
+def format_display_datetime(value) -> str:
+    if not value or str(value).strip() in ("-", "—"):
+        return "—"
+    s = str(value).strip()
+    dt = _parse_ts(s)
+    if dt:
+        return dt.strftime("%d.%m.%Y %H:%M:%S")
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10].split("-")[2] + "." + s[5:7] + "." + s[:4] + (s[10:] if len(s) > 10 else "")
+    return s
+
+
+def format_iso_date_tr(iso_day: str | None) -> str:
+    if not iso_day or len(iso_day) < 10 or iso_day[4] != "-":
+        return str(iso_day or "")
+    return f"{iso_day[8:10]}.{iso_day[5:7]}.{iso_day[:4]}"
+
+
+@app.template_filter("tr_iso_date")
+def jinja_iso_date(val):
+    return format_iso_date_tr(val)
+@app.template_filter("tr_dt")
+def jinja_tr_dt(value):
+    return format_display_datetime(value)
+
+
+@app.template_filter("sure_tr")
+def jinja_sure_tr(value):
+    try:
+        return format_duration_tr(int(value))
+    except (TypeError, ValueError):
+        return "—"
+
+
+def reconcile_personel_lock(db):
+    lock = session.get("pdks_choice_lock")
+    if not lock:
+        return
+    row = db.execute(
+        """
+        SELECT id FROM attendance
+        WHERE personnel_id = ? AND branch_id = ? AND checkout_at IS NULL
+        """,
+        (lock["personnel_id"], lock["branch_id"]),
+    ).fetchone()
+    if not row:
+        session.pop("pdks_choice_lock", None)
+        session.modified = True
+
+
+def choice_lock_error_response(db, personnel_id: int, branch_id: int):
+    reconcile_personel_lock(db)
+    lock = session.get("pdks_choice_lock")
+    if not lock:
+        return None
+    if int(lock["personnel_id"]) != int(personnel_id) or int(lock["branch_id"]) != int(branch_id):
+        return jsonify(
+            {
+                "ok": False,
+                "message": (
+                    f"Bu cihazda önce seçtiğiniz personel işlemini bitirmelisiniz: "
+                    f"{lock.get('full_name', '')}. Çıkış yapmadan başka kişi veya mağaza seçilemez."
+                ),
+            }
+        ), 400
+    return None
 
 
 def get_client_ip():
@@ -194,7 +300,7 @@ def fetch_branches(active_only=False):
     q = "SELECT * FROM branches"
     if active_only:
         q += " WHERE active = 1"
-    q += " ORDER BY active DESC, name"
+    q += " ORDER BY name"
     return db.execute(q).fetchall()
 
 
@@ -218,20 +324,9 @@ def fetch_personnel_admin():
         SELECT p.*, b.name AS branch_name
         FROM personnel p
         JOIN branches b ON b.id = p.branch_id
-        ORDER BY p.active DESC, p.full_name
+        ORDER BY p.full_name
         """
     ).fetchall()
-
-
-def _parse_ts(s):
-    try:
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError):
-        return None
-
-
-def _minutes_between(start_dt, end_dt):
-    return max(0, int((end_dt - start_dt).total_seconds() // 60))
 
 
 def personnel_work_stats(db, personnel_id: int):
@@ -243,9 +338,10 @@ def personnel_work_stats(db, personnel_id: int):
         (personnel_id,),
     ).fetchall()
 
-    now = datetime.now()
+    now = now_tr()
+
     today_s = now.strftime("%Y-%m-%d")
-    mon_start = now.replace(day=1).date()
+    mon_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).date()
     week_start_date = now.date() - timedelta(days=(now.weekday()))
     week_end_date = week_start_date + timedelta(days=6)
 
@@ -257,7 +353,7 @@ def personnel_work_stats(db, personnel_id: int):
             if r["checkout_at"]:
                 total += int(r["duration_minutes"] or 0)
             elif r["checkin_at"]:
-                ci = _parse_ts(r["checkin_at"])
+                ci = _parse_ts_tr(r["checkin_at"])
                 if ci:
                     total += _minutes_between(ci, now)
         return total
@@ -291,10 +387,13 @@ def personnel_work_stats(db, personnel_id: int):
 
     return {
         "today_hours": fmt_h(today_minutes),
+        "today_hm": format_duration_tr(today_minutes),
         "week_days": len(weekly_days),
         "week_hours": fmt_h(weekly_minutes),
+        "week_hm": format_duration_tr(weekly_minutes),
         "month_days": len(monthly_days),
         "month_hours": fmt_h(monthly_minutes),
+        "month_hm": format_duration_tr(monthly_minutes),
     }
 
 
@@ -369,15 +468,13 @@ def admin():
                 except sqlite3.IntegrityError:
                     flash("Bu isimde mağaza zaten var.", "danger")
 
-        elif action == "deactivate_branch":
+        elif action == "delete_branch":
             bid = int(request.form["branch_id"])
-            db.execute("UPDATE branches SET active = 0 WHERE id = ?", (bid,))
-            db.execute(
-                "UPDATE personnel SET active = 0 WHERE branch_id = ?",
-                (bid,),
-            )
+            db.execute("DELETE FROM attendance WHERE branch_id = ?", (bid,))
+            db.execute("DELETE FROM personnel WHERE branch_id = ?", (bid,))
+            db.execute("DELETE FROM branches WHERE id = ?", (bid,))
             db.commit()
-            flash("Mağaza kapatıldı; bağlı personel de pasif edildi.", "success")
+            flash("Mağaza ve bağlı kayıtlar silindi.", "success")
 
         elif action == "set_branch_ip":
             bid = int(request.form["branch_id"])
@@ -404,13 +501,15 @@ def admin():
             db.commit()
             flash("Personel eklendi.", "success")
 
-        elif action == "deactivate_personnel":
-            db.execute(
-                "UPDATE personnel SET active = 0 WHERE id = ?",
-                (int(request.form["personnel_id"]),),
-            )
+        elif action == "delete_personnel":
+            pid = int(request.form["personnel_id"])
+            db.execute("DELETE FROM attendance WHERE personnel_id = ?", (pid,))
+            db.execute("DELETE FROM personnel WHERE id = ?", (pid,))
             db.commit()
-            flash("Personel pasif yapıldı.", "success")
+            flash("Personel ve mesai kayıtları silindi.", "success")
+            return_pid = request.form.get("return_pid", type=int)
+            if return_pid == pid:
+                return redirect(url_for("admin"))
 
         elif action == "add_note":
             content = request.form.get("content", "").strip()
@@ -472,17 +571,26 @@ def admin():
 @app.route("/personel")
 def personel():
     db = get_db()
+    reconcile_personel_lock(db)
     branches = fetch_branches(active_only=True)
     personnel_rows = fetch_personnel_for_public()
     latest_note = db.execute(
         "SELECT content, created_at FROM announcements ORDER BY id DESC LIMIT 1"
     ).fetchone()
+    choice_lock = session.get("pdks_choice_lock")
     return render_template(
         "personel.html",
         branches=branches,
         personnel=personnel_rows,
         latest_note=latest_note,
+        choice_lock=choice_lock,
     )
+
+
+@app.get("/health")
+def health():
+    """Render / denetim: tarayıcıda /health açınca 'ok' görünmeli."""
+    return Response("ok", mimetype="text/plain")
 
 
 @app.route("/tara")
@@ -507,6 +615,10 @@ def api_personnel_status():
         return jsonify({"ok": False, "message": "Mağaza ve personeli seçin."}), 400
 
     db = get_db()
+    reconcile_personel_lock(db)
+    chk = choice_lock_error_response(db, personnel_id, branch_id)
+    if chk is not None:
+        return chk
     person = db.execute(
         "SELECT id, full_name, branch_id FROM personnel WHERE id = ? AND active = 1",
         (personnel_id,),
@@ -563,9 +675,14 @@ def api_personnel_status():
 @app.post("/api/punch")
 def api_punch():
     db = get_db()
+    reconcile_personel_lock(db)
     personnel_id = int(request.form["personnel_id"])
     branch_id = int(request.form["branch_id"])
     action = request.form["action"]
+
+    chk = choice_lock_error_response(db, personnel_id, branch_id)
+    if chk is not None:
+        return chk
 
     branch = db.execute(
         "SELECT * FROM branches WHERE id = ? AND active = 1", (branch_id,)
@@ -626,16 +743,25 @@ def api_punch():
             (
                 personnel_id,
                 branch_id,
-                datetime.now().strftime("%Y-%m-%d"),
+                now_tr().strftime("%Y-%m-%d"),
                 now_str(),
             ),
         )
         db.commit()
+        session["pdks_choice_lock"] = {
+            "personnel_id": personnel_id,
+            "branch_id": branch_id,
+            "full_name": person["full_name"],
+            "branch_name": branch["name"],
+        }
+        session.modified = True
         return jsonify({"ok": True, "message": f"{person['full_name']}: giriş kaydı alındı."})
 
     if action == "out":
-        checkin_at = datetime.strptime(open_record["checkin_at"], "%Y-%m-%d %H:%M:%S")
-        duration = max(0, int((datetime.now() - checkin_at).total_seconds() // 60))
+        ci = _parse_ts_tr(open_record["checkin_at"])
+        if not ci:
+            return jsonify({"ok": False, "message": "Kayıt hatası (giriş saati)."}), 400
+        duration = max(0, int((now_tr() - ci).total_seconds() // 60))
         db.execute(
             """
             UPDATE attendance
@@ -645,6 +771,8 @@ def api_punch():
             (now_str(), duration, open_record["id"]),
         )
         db.commit()
+        session.pop("pdks_choice_lock", None)
+        session.modified = True
         return jsonify({"ok": True, "message": f"{person['full_name']}: çıkış kaydı alındı."})
 
     return jsonify({"ok": False, "message": "Geçersiz işlem."}), 400
@@ -670,16 +798,16 @@ def export_excel():
 
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["İsim", "Mağaza", "Tarih", "Giriş", "Çıkış", "Süre (dk)"])
+    writer.writerow(["İsim", "Mağaza", "Tarih", "Giriş", "Çıkış", "Süre"])
     for row in rows:
         writer.writerow(
             [
                 row["isim"],
                 row["sube"],
-                row["tarih"],
-                row["giris"],
-                row["cikis"],
-                row["dk"],
+                format_iso_date_tr(row["tarih"]),
+                format_display_datetime(row["giris"]) if row["giris"] not in ("-", None) else "—",
+                format_display_datetime(row["cikis"]) if row["cikis"] not in ("-", None) else "—",
+                format_duration_tr(row["dk"]),
             ]
         )
     resp = Response(output.getvalue(), mimetype="application/vnd.ms-excel")

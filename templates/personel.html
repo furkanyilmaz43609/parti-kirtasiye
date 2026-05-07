@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="tr">
+<html lang="tr" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,79 +7,116 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         :root {
-            --bg: #f4f6f8;
-            --card: #ffffff;
-            --text: #2c3338;
-            --muted: #6b7280;
-            --accent: #3d7a63;
-            --accent-hover: #2f6250;
-            --border: #e5e7eb;
+            --bg: #0a0b10;
+            --panel: #151922;
+            --panel2: #1a1f2a;
+            --line: #353b4d;
+            --text: #f0f2f7;
+            --muted: #8b93a3;
+            --in: #3d8f6e;
+            --out: #cfa23a;
         }
         body {
-            background: var(--bg);
+            background: radial-gradient(ellipse 120% 80% at 50% -20%, #1a222e 0%, var(--bg) 55%);
             color: var(--text);
             min-height: 100vh;
+            margin: 0;
             font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
         }
-        .shell { max-width: 420px; margin: 0 auto; padding: 1.25rem 1rem 2rem; }
-        .card-pdks {
-            background: var(--card);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            box-shadow: 0 1px 3px rgba(0,0,0,.06);
+        .outer {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: clamp(1rem, 4vw, 2.5rem);
         }
-        .btn-accent { background-color: var(--accent); border-color: var(--accent); color: #fff; }
-        .btn-accent:hover:not(:disabled) { background-color: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
-        .form-select, .form-control { border-color: var(--border); }
-        .form-select:focus, .form-control:focus { border-color: var(--accent); box-shadow: 0 0 0 0.2rem rgba(61,122,99,.18); }
+        .shell {
+            width: 100%;
+            max-width: min(92vw, 520px);
+        }
+        @media (min-width: 992px) {
+            .shell { max-width: min(880px, 92vw); }
+        }
+        .card-pdks {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            box-shadow: 0 24px 48px rgba(0,0,0,.45);
+        }
+        .btn-in { background: var(--in); border-color: var(--in); color: #fff; }
+        .btn-in:hover:not(:disabled) { filter: brightness(1.08); color: #fff; }
+        .btn-out { background: var(--out); border-color: var(--out); color: #12151b; font-weight: 600; }
+        .btn-out:hover:not(:disabled) { filter: brightness(1.05); color: #12151b; }
+        .form-select, .form-control {
+            background: var(--panel2);
+            border-color: var(--line);
+            color: var(--text);
+        }
+        .form-select:focus, .form-control:focus {
+            border-color: var(--in);
+            box-shadow: 0 0 0 .2rem rgba(61,143,110,.2);
+            background: var(--panel2);
+            color: var(--text);
+        }
+        .form-select:disabled { opacity: .75; }
+        .lock-banner { background: rgba(207,162,58,.12); border: 1px solid rgba(207,162,58,.35); border-radius: 8px; }
     </style>
 </head>
 <body>
-<div class="shell">
-    <div class="card-pdks p-4">
-        <h1 class="h5 fw-semibold mb-1">Giriş / Çıkış</h1>
-        <p class="small text-secondary mb-3">Mağazanın kablosuz internetine bağlı olduğunuzdan emin olun.</p>
+<div class="outer">
+    <div class="shell">
+        <div class="card-pdks p-4 p-md-5">
+            <h1 class="h5 fw-semibold mb-1" style="color:var(--text)">Giriş / Çıkış</h1>
+            <p class="small mb-3" style="color:var(--muted)">Mağaza ağı (tanımlı çıkış IP) gerekir. Saat: Türkiye (UTC+3).</p>
 
-        {% if latest_note %}
-            <div class="alert alert-light border small mb-3 py-2">
-                <strong class="text-dark">Not:</strong> {{ latest_note.content }}
+            {% if choice_lock is not none and choice_lock.personnel_id is defined %}
+            <div class="lock-banner small p-2 mb-3 text-warning">
+                Şu an bu cihaz <strong>{{ choice_lock.full_name }}</strong> için kilitli — çıkış yapana kadar başka mağaza/personel seçemezsiniz.
             </div>
-        {% endif %}
+            {% endif %}
 
-        <form id="p-form" class="row g-3">
-            <div class="col-12">
-                <label class="form-label small mb-1">Mağaza</label>
-                <select class="form-select" id="branch_id" name="branch_id" required aria-label="Mağaza">
-                    <option value="">Seçiniz</option>
-                    {% for b in branches %}
-                        <option value="{{ b.id }}">{{ b.name }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-            <div class="col-12">
-                <label class="form-label small mb-1">Ad Soyad</label>
-                <select class="form-select" id="personnel_id" name="personnel_id" required aria-label="Personel">
-                    <option value="">Önce mağaza seçin</option>
-                    {% for p in personnel %}
-                        <option value="{{ p.id }}" data-branch="{{ p.branch_id }}">{{ p.full_name }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-            <input type="hidden" name="action" id="action-field" value="">
+            {% if latest_note %}
+                <div class="alert alert-secondary border-secondary small mb-3 py-2">
+                    <strong>Not:</strong> {{ latest_note.content }}
+                </div>
+            {% endif %}
 
-            <div class="col-12">
-                <div id="info" class="small text-muted">Mağaza ve isim seçilince sıradaki işlem belirlenecek.</div>
-            </div>
+            <form id="p-form" class="row g-3">
+                <div class="col-12">
+                    <label class="form-label small mb-1">Mağaza</label>
+                    <select class="form-select" id="branch_id" name="branch_id" required aria-label="Mağaza">
+                        <option value="">Seçiniz</option>
+                        {% for b in branches %}
+                            <option value="{{ b.id }}">{{ b.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-12">
+                    <label class="form-label small mb-1">Ad Soyad</label>
+                    <select class="form-select" id="personnel_id" name="personnel_id" required aria-label="Personel">
+                        <option value="">Önce mağaza seçin</option>
+                        {% for p in personnel %}
+                            <option value="{{ p.id }}" data-branch="{{ p.branch_id }}">{{ p.full_name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <input type="hidden" name="action" id="action-field" value="">
 
-            <div class="col-12 d-grid">
-                <button type="submit" class="btn btn-accent btn-lg" id="submit-btn" disabled>Yükleniyor…</button>
-            </div>
-        </form>
-        <div id="feedback" class="mt-3 small"></div>
+                <div class="col-12">
+                    <div id="info" class="small text-secondary">Mağaza ve isim seçilince sıradaki işlem gösterilir.</div>
+                </div>
+
+                <div class="col-12 d-grid">
+                    <button type="submit" class="btn btn-lg btn-in" id="submit-btn" disabled>Yükleniyor…</button>
+                </div>
+            </form>
+            <div id="feedback" class="mt-3 small"></div>
+        </div>
     </div>
 </div>
 
 <script>
+    const LOCK = {% if choice_lock is not none and choice_lock.personnel_id is defined and choice_lock.branch_id is defined %}{{ choice_lock | tojson | safe }}{% else %}null{% endif %};
     const branch = document.getElementById("branch_id");
     const pers = document.getElementById("personnel_id");
     const actionF = document.getElementById("action-field");
@@ -88,6 +125,7 @@
     const fb = document.getElementById("feedback");
 
     function filt() {
+        if (LOCK) return;
         const bid = branch.value;
         pers.options[0].textContent = bid ? "Personel seçin" : "Önce mağaza seçin";
         for (let i = 1; i < pers.options.length; i++) {
@@ -104,42 +142,51 @@
         actionF.value = "";
         const bid = branch.value, pid = pers.value;
         if (!bid || !pid) {
-            info.innerHTML = "Mağazanın kayıtlı çıkış IP adresi ile aynı ağdasınız gerekiyor.";
+            info.textContent = LOCK
+                ? ""
+                : "Mağaza ve personeli seçin.";
             btn.disabled = true;
-            btn.classList.remove("btn-warning", "text-dark");
-            btn.classList.add("btn-accent");
-            btn.textContent = "Önce seçin";
+            btn.className = "btn btn-lg btn-secondary";
+            btn.textContent = LOCK ? "Önce seçin" : "Önce seçin";
             return;
         }
         info.textContent = "Kontrol ediliyor…";
         btn.disabled = true;
-        const r = await fetch(`/api/personnel-durum?personnel_id=${encodeURIComponent(pid)}&branch_id=${encodeURIComponent(bid)}`);
-        const d = await r.json();
+        let r, d;
+        try {
+            r = await fetch(`/api/personnel-durum?personnel_id=${encodeURIComponent(pid)}&branch_id=${encodeURIComponent(bid)}`);
+            d = await r.json();
+        } catch (err) {
+            info.innerHTML = "Bağlantı kurulamadı (özellikle Render ücretsiz planda uyku süresi sonra ilk açılış yavaştır). <strong>Bir süre bekleyip sayfayı yenileyin</strong> veya daha sonra deneyin.";
+            btn.disabled = true;
+            btn.textContent = "Yenilemeniz gerekiyor";
+            btn.className = "btn btn-lg btn-secondary";
+            return;
+        }
         if (!d.ok) {
             info.textContent = d.message || "Hata.";
             btn.textContent = "İşlem yok";
+            btn.className = "btn btn-lg btn-secondary";
             return;
         }
         if (d.next_action === "blocked") {
             actionF.value = "";
-            info.innerHTML = `<span class="text-danger">${d.message || "Bu ağdan işlem yapılamıyor."}</span><br>
-                <span class="text-muted">Görünen adres: ${d.client_ip || "—"}</span>`;
+            info.innerHTML = `<span class="text-warning">${d.message || "Bu ağdan işlem yapılamıyor."}</span><br>
+                <span class="text-muted">Görünen: ${d.client_ip || "—"}</span>`;
             btn.disabled = true;
             btn.textContent = "Kapalı";
-            btn.classList.remove("btn-accent", "btn-warning");
-            btn.classList.add("btn-secondary");
+            btn.className = "btn btn-lg btn-secondary";
             return;
         }
         actionF.value = d.next_action;
-        info.innerHTML = `Bağlantı uygun görünüyor. <span class="text-muted">(${d.client_ip})</span>`;
+        info.innerHTML = `Bağlantı uygun <span class="text-muted">(${d.client_ip})</span>`;
         btn.disabled = false;
-        btn.classList.remove("btn-secondary", "btn-accent");
+        btn.classList.remove("btn-in", "btn-out", "btn-secondary");
         if (d.next_action === "out") {
-            btn.classList.add("btn-warning", "text-dark");
+            btn.classList.add("btn-out");
             btn.textContent = "Çıkış Yap";
         } else {
-            btn.classList.remove("btn-warning", "text-dark");
-            btn.classList.add("btn-accent");
+            btn.classList.add("btn-in");
             btn.textContent = "Giriş Yap";
         }
     }
@@ -155,10 +202,19 @@
         const data = await res.json();
         fb.className = "mt-3 small " + (data.ok ? "text-success" : "text-danger");
         fb.textContent = data.message;
-        if (data.ok) await sync();
+        if (data.ok) window.location.reload();
     });
 
-    filt();
+    if (LOCK) {
+        branch.value = String(LOCK.branch_id);
+        branch.disabled = true;
+        pers.disabled = true;
+        for (let i = 1; i < pers.options.length; i++) pers.options[i].hidden = false;
+        pers.value = String(LOCK.personnel_id);
+        sync();
+    } else {
+        filt();
+    }
 </script>
 </body>
 </html>
