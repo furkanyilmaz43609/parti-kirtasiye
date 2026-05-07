@@ -71,6 +71,7 @@ def init_db():
             code TEXT,
             shift_start TEXT NOT NULL DEFAULT '09:00',
             shift_end TEXT NOT NULL DEFAULT '18:00',
+            allowed_ip TEXT,
             created_at TEXT NOT NULL
         );
 
@@ -131,6 +132,14 @@ def init_db():
         """
     )
     db.commit()
+    _ensure_branch_allowed_ip_column(db)
+
+
+def _ensure_branch_allowed_ip_column(db):
+    names = [r["name"] for r in db.execute("PRAGMA table_info(branches)").fetchall()]
+    if "allowed_ip" not in names:
+        db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
+        db.commit()
 
 
 @app.before_request
@@ -144,6 +153,27 @@ def require_admin():
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",", maxsplit=1)[0].strip()
+    return (request.remote_addr or "").strip()
+
+
+def branch_ip_allowed(branch_row, client_ip: str) -> bool:
+    if not branch_row:
+        return True
+    try:
+        allowed_raw = branch_row["allowed_ip"]
+    except (KeyError, IndexError, TypeError):
+        return True
+    allowed = (allowed_raw or "").strip()
+    if not allowed:
+        return True
+    allowed_list = [x.strip() for x in allowed.split(",") if x.strip()]
+    return client_ip in allowed_list
 
 
 def get_setting(key: str):
@@ -258,21 +288,31 @@ def admin():
         action = request.form.get("action", "")
 
         if action == "add_branch":
+            allowed_ip = request.form.get("allowed_ip", "").strip() or None
             db.execute(
                 """
-                INSERT INTO branches (name, code, shift_start, shift_end, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO branches (name, code, shift_start, shift_end, allowed_ip, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request.form["name"].strip(),
                     request.form.get("code", "").strip() or None,
                     request.form.get("shift_start", "09:00"),
                     request.form.get("shift_end", "18:00"),
+                    allowed_ip,
                     now_str(),
                 ),
             )
             db.commit()
             flash("Sube eklendi.")
+
+        elif action == "set_branch_allowed_ip":
+            bid = int(request.form["branch_id"])
+            raw = request.form.get("allowed_ip", "").strip()
+            val = raw if raw else None
+            db.execute("UPDATE branches SET allowed_ip = ? WHERE id = ?", (val, bid))
+            db.commit()
+            flash("Sube IP kisiti guncellendi.")
 
         elif action == "add_personnel":
             db.execute(
@@ -423,6 +463,57 @@ def tara():
     )
 
 
+@app.get("/api/personnel-durum")
+def api_personnel_status():
+    try:
+        personnel_id = int(request.args.get("personnel_id", "0"))
+        branch_id = int(request.args.get("branch_id", "0"))
+    except ValueError:
+        return jsonify({"ok": False, "message": "Gecersiz parametre"}), 400
+
+    if not personnel_id or not branch_id:
+        return jsonify({"ok": False, "message": "Personel ve sube secilmeli"}), 400
+
+    db = get_db()
+    person = db.execute(
+        "SELECT id, full_name, branch_id FROM personnel WHERE id = ? AND active = 1",
+        (personnel_id,),
+    ).fetchone()
+    if not person:
+        return jsonify({"ok": False, "message": "Personel bulunamadi"}), 404
+    if person["branch_id"] != branch_id:
+        return jsonify({"ok": False, "message": "Bu personel secilen subeye bagli degil"}), 400
+
+    branch = db.execute("SELECT * FROM branches WHERE id = ?", (branch_id,)).fetchone()
+    if not branch:
+        return jsonify({"ok": False, "message": "Sube bulunamadi"}), 404
+
+    client_ip = get_client_ip()
+    allowed_raw = (branch["allowed_ip"] or "").strip()
+    ip_check_enabled = bool(allowed_raw)
+    ip_ok = branch_ip_allowed(branch, client_ip)
+
+    open_record = db.execute(
+        """
+        SELECT id FROM attendance
+        WHERE personnel_id = ? AND branch_id = ? AND checkout_at IS NULL
+        ORDER BY id DESC LIMIT 1
+        """,
+        (personnel_id, branch_id),
+    ).fetchone()
+    next_action = "out" if open_record else "in"
+
+    return jsonify(
+        {
+            "ok": True,
+            "next_action": next_action,
+            "client_ip": client_ip,
+            "ip_check_enabled": ip_check_enabled,
+            "ip_ok": ip_ok,
+        }
+    )
+
+
 @app.post("/api/punch")
 def api_punch():
     db = get_db()
@@ -433,6 +524,26 @@ def api_punch():
 
     if code != generate_dynamic_code(branch_id):
         return jsonify({"ok": False, "message": "Kod gecersiz veya suresi doldu."}), 400
+
+    branch = db.execute("SELECT * FROM branches WHERE id = ?", (branch_id,)).fetchone()
+    if not branch:
+        return jsonify({"ok": False, "message": "Sube bulunamadi."}), 404
+
+    client_ip = get_client_ip()
+    if not branch_ip_allowed(branch, client_ip):
+        allowed_hint = (branch["allowed_ip"] or "").strip()
+        return jsonify(
+            {
+                "ok": False,
+                "message": (
+                    f"Bu sube icin IP dogrulanamadi. Sizin IP: {client_ip}. "
+                    f"Mağaza sabit internet IP'sini yonetici panelinde tanimlamali "
+                    "(veya cep verisi kullaniyorsaniz mobil IP yazilmali)."
+                ),
+                "client_ip": client_ip,
+                "allowed_ip": allowed_hint,
+            }
+        ), 403
 
     person = db.execute(
         "SELECT id, full_name, branch_id FROM personnel WHERE id = ? AND active = 1",
@@ -453,9 +564,16 @@ def api_punch():
         (personnel_id, branch_id),
     ).fetchone()
 
+    expected = "out" if open_record else "in"
+    if action != expected:
+        mes = (
+            "Simdi yalnizca cikis yapabilirsiniz."
+            if expected == "out"
+            else "Simdi yalnizca giris yapabilirsiniz."
+        )
+        return jsonify({"ok": False, "message": mes}), 400
+
     if action == "in":
-        if open_record:
-            return jsonify({"ok": False, "message": "Cikis yapmadan tekrar giris yapilamaz."}), 400
         db.execute(
             """
             INSERT INTO attendance (personnel_id, branch_id, date, checkin_at, source)
@@ -472,8 +590,6 @@ def api_punch():
         return jsonify({"ok": True, "message": f"{person['full_name']} icin giris kaydedildi."})
 
     if action == "out":
-        if not open_record:
-            return jsonify({"ok": False, "message": "Cikis icin aktif giris bulunamadi."}), 400
         checkin_at = datetime.strptime(open_record["checkin_at"], "%Y-%m-%d %H:%M:%S")
         duration = max(0, int((datetime.now() - checkin_at).total_seconds() // 60))
         db.execute(

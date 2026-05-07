@@ -60,6 +60,9 @@
                     <div class="col-12"><input class="form-control" name="code" placeholder="Opsiyonel sabit şube kodu"></div>
                     <div class="col-6"><input type="time" class="form-control" name="shift_start" value="09:00" required></div>
                     <div class="col-6"><input type="time" class="form-control" name="shift_end" value="18:00" required></div>
+                    <div class="col-12">
+                        <input class="form-control" name="allowed_ip" placeholder="İsteğe bağlı: Şube çıkış IP (WAN), virgülle birden fazla örn: 212.174.x.x">
+                    </div>
                     <div class="col-12 d-grid"><button class="btn btn-primary">Kaydet</button></div>
                 </form>
             </div>
@@ -214,6 +217,28 @@
                         </tbody>
                     </table>
                 </div>
+            </div>
+
+            <div class="card section-card p-3 mb-3">
+                <h5>Şube IP kısıtı (personel ekranı)</h5>
+                <p class="small text-secondary mb-2">
+                    Boş bırakırsanız sadece <strong>dinamik kod</strong> yeterli. IP yazarsanız personel telefonu o IP’den gelmek zorunda (virgülle birden fazla).
+                    Not: Mobil veri IP’si sık değişir; mağaza <strong>WIFI / sabit hat</strong> için uygundur.
+                </p>
+                {% for b in branches %}
+                    <form method="post" class="row g-2 align-items-center mb-2 border-bottom border-secondary pb-2">
+                        <input type="hidden" name="action" value="set_branch_allowed_ip">
+                        <input type="hidden" name="branch_id" value="{{ b.id }}">
+                        <div class="col-12 col-md-3 small text-light fw-semibold">{{ b.name }}</div>
+                        <div class="col-12 col-md-7">
+                            <input class="form-control form-control-sm" name="allowed_ip" value="{{ b['allowed_ip'] if b['allowed_ip'] else '' }}"
+                                   placeholder="örn: 85.xx.xx.xx veya iki IP virgülle">
+                        </div>
+                        <div class="col-12 col-md-2">
+                            <button type="submit" class="btn btn-sm btn-outline-light w-100">IP kaydet</button>
+                        </div>
+                    </form>
+                {% endfor %}
             </div>
 
             <div class="card section-card p-3">
