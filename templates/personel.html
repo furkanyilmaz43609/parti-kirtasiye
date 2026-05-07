@@ -197,12 +197,33 @@
     document.getElementById("p-form").addEventListener("submit", async (e) => {
         e.preventDefault();
         if (!actionF.value) return;
+        btn.disabled = true;
         const fd = new FormData(e.target);
-        const res = await fetch("/api/punch", { method: "POST", body: fd });
-        const data = await res.json();
-        fb.className = "mt-3 small " + (data.ok ? "text-success" : "text-danger");
-        fb.textContent = data.message;
-        if (data.ok) window.location.reload();
+        if (LOCK) {
+            fd.set("branch_id", String(LOCK.branch_id));
+            fd.set("personnel_id", String(LOCK.personnel_id));
+        }
+        try {
+            const res = await fetch("/api/punch", { method: "POST", body: fd });
+            const text = await res.text();
+            let data;
+            try {
+                data = JSON.parse(text);
+            } catch (_) {
+                data = { ok: false, message: "Sunucu beklenmeyen yanıt döndü. Sayfayı yenileyip tekrar deneyin." };
+            }
+            fb.className = "mt-3 small " + (data.ok ? "text-success" : "text-danger");
+            fb.textContent = data.message || "İşlem tamamlanamadı.";
+            if (data.ok) {
+                window.location.reload();
+                return;
+            }
+        } catch (_err) {
+            fb.className = "mt-3 small text-danger";
+            fb.textContent = "Bağlantı hatası oluştu. Lütfen tekrar deneyin.";
+        }
+        btn.disabled = false;
+        sync();
     });
 
     if (LOCK) {
