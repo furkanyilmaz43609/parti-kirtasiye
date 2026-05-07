@@ -19,10 +19,16 @@ from flask import (
     url_for,
 )
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "pdks-super-secret-key-2026"
-DATABASE = "pdks_merkez.db"
-CODE_SECRET = "dynamic-code-secret-branch-2026"
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "pdks-local-dev-change-me")
+
+# SQLite: Render'da kalıcı disk kullanırsanız Environment Variable ile örn.
+# DATABASE_PATH=/var/data/pdks_merkez.db
+DATABASE = os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "pdks_merkez.db"))
+
+CODE_SECRET = os.environ.get("CODE_SECRET", "dynamic-code-secret-branch-2026")
 
 
 def get_db():
@@ -600,4 +606,5 @@ def export_excel():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
