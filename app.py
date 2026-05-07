@@ -521,6 +521,12 @@ def admin():
                 db.commit()
                 flash("Duyuru kaydedildi.", "success")
 
+        elif action == "delete_note":
+            note_id = int(request.form["announcement_id"])
+            db.execute("DELETE FROM announcements WHERE id = ?", (note_id,))
+            db.commit()
+            flash("Duyuru silindi.", "success")
+
         return_pid = request.form.get("return_pid", type=int)
         if return_pid:
             return redirect(url_for("admin", pid=return_pid))
@@ -541,7 +547,7 @@ def admin():
     ).fetchall()
 
     latest_notes = db.execute(
-        "SELECT content, created_at FROM announcements ORDER BY id DESC LIMIT 5"
+        "SELECT id, content, created_at FROM announcements ORDER BY id DESC LIMIT 20"
     ).fetchall()
 
     selected_pid = request.args.get("pid", type=int)

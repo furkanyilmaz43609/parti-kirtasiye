@@ -101,9 +101,18 @@
                 </form>
                 {% if latest_notes %}
                     <hr class="my-3 border-secondary opacity-25">
-                    <div class="small text-secondary">
+                    <div class="small text-secondary mb-1">Son duyurular · sil</div>
+                    <div class="small">
                         {% for n in latest_notes %}
-                            <div class="mb-2">{{ n.content }} · <span>{{ n.created_at|tr_dt }}</span></div>
+                            <div class="d-flex flex-wrap align-items-start gap-2 justify-content-between mb-2 pb-2 border-bottom border-secondary border-opacity-25">
+                                <span class="text-secondary flex-grow-1" style="min-width:140px">{{ n.content }} <span class="text-muted">· {{ n.created_at|tr_dt }}</span></span>
+                                <form method="post" class="mb-0 flex-shrink-0" onsubmit="return confirm('Bu duyuruyu silmek istediğinize emin misiniz?');">
+                                    <input type="hidden" name="action" value="delete_note">
+                                    <input type="hidden" name="announcement_id" value="{{ n.id }}">
+                                    {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                                    <button type="submit" class="btn btn-sm btn-link text-danger p-0 small text-decoration-none">Sil</button>
+                                </form>
+                            </div>
                         {% endfor %}
                     </div>
                 {% endif %}
