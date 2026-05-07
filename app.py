@@ -30,6 +30,22 @@ DATABASE = os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "pdks_merkez.d
 
 CODE_SECRET = os.environ.get("CODE_SECRET", "dynamic-code-secret-branch-2026")
 
+_RENDER_HOSTED = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
+if _RENDER_HOSTED:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+    app.config["SESSION_COOKIE_SECURE"] = True
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+
+def redirect_after_admin_login(request_next: str):
+    target = (request_next or "").strip()
+    if target.startswith("/") and not target.startswith("//") and "\r" not in target and "\n" not in target:
+        return redirect(target)
+    return redirect(url_for("admin"))
+
 
 def get_db():
     if "db" not in g:
@@ -190,6 +206,11 @@ def fetch_personnel():
 def index():
     admin_hash = get_setting("admin_password_hash")
     mode = "setup" if not admin_hash else "login"
+    next_url = (
+        (request.form.get("next") or request.args.get("next") or "").strip()
+        if request.method == "POST"
+        else (request.args.get("next") or "").strip()
+    )
 
     if request.method == "POST":
         action = request.form.get("action", "").strip()
@@ -198,22 +219,22 @@ def index():
             password = request.form.get("password", "").strip()
             confirm_password = request.form.get("confirm_password", "").strip()
             if len(password) < 4:
-                flash("Sifre en az 4 karakter olmali.")
+                flash("Sifre en az 4 karakter olmali.", "danger")
             elif password != confirm_password:
-                flash("Sifre ve tekrar sifre ayni olmali.")
+                flash("Sifre ve tekrar sifre ayni olmali.", "danger")
             else:
                 set_setting("admin_password_hash", hash_password(password))
                 session["is_admin"] = True
-                return redirect(url_for("admin"))
+                return redirect_after_admin_login(next_url)
 
         if mode == "login" and action == "login":
             password = request.form.get("password", "").strip()
             if verify_password(password):
                 session["is_admin"] = True
-                return redirect(url_for("admin"))
-            flash("Yonetici sifresi hatali.")
+                return redirect_after_admin_login(next_url)
+            flash("Yonetici sifresi hatali.", "danger")
 
-    return render_template("index.html", mode=mode)
+    return render_template("index.html", mode=mode, next=next_url)
 
 
 @app.route("/logout")
@@ -225,7 +246,11 @@ def logout():
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     if not require_admin():
-        return redirect(url_for("index"))
+        flash(
+            "Yönetim paneli korumalıdır. Önce şifre ile giriş yapın; ardından tam yönetim ekranı açılır.",
+            "info",
+        )
+        return redirect(url_for("index", next=request.path))
 
     db = get_db()
 

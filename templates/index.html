@@ -33,17 +33,26 @@
         {% endif %}
     </p>
 
-    {% with messages = get_flashed_messages() %}
+    {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
-            <div class="alert alert-danger">
-                {{ messages[0] }}
-            </div>
+            {% for category, message in messages %}
+                {% if category == "info" %}
+                    <div class="alert alert-info">{{ message }}</div>
+                {% elif category == "danger" %}
+                    <div class="alert alert-danger">{{ message }}</div>
+                {% elif category == "success" %}
+                    <div class="alert alert-success">{{ message }}</div>
+                {% else %}
+                    <div class="alert alert-secondary">{{ message }}</div>
+                {% endif %}
+            {% endfor %}
         {% endif %}
     {% endwith %}
 
     {% if mode == "setup" %}
         <form method="post">
             <input type="hidden" name="action" value="setup_password">
+            <input type="hidden" name="next" value="{{ next or '' }}">
             <div class="mb-3">
                 <label for="password" class="form-label">Yeni Yönetici Şifresi</label>
                 <input type="password" class="form-control form-control-lg" id="password" name="password" required>
@@ -57,6 +66,7 @@
     {% else %}
         <form method="post">
             <input type="hidden" name="action" value="login">
+            <input type="hidden" name="next" value="{{ next or '' }}">
             <div class="mb-3">
                 <label for="password" class="form-label">Yönetici Şifresi</label>
                 <input type="password" class="form-control form-control-lg" id="password" name="password" required>
