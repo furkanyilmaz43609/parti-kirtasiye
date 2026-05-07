@@ -1,334 +1,235 @@
 <!doctype html>
-<html lang="tr" data-bs-theme="dark">
+<html lang="tr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDKS Yönetim Paneli</title>
+    <title>Yönetim</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
-        body { background: #020617; color: #e2e8f0; }
-        .stat-card { border: 1px solid #334155; background: #0f172a; }
-        .table { --bs-table-bg: transparent; }
-        .mini { font-size: .9rem; color: #94a3b8; }
-        .section-card { background: #0b1220; border: 1px solid #334155; }
+        :root {
+            --page: #f0f3f6;
+            --surface: #fff;
+            --ink: #1f2937;
+            --muted: #6b7280;
+            --line: #e5e7eb;
+            --green: #2f6f5e;
+            --green-soft: #e8f2ef;
+        }
+        body { background: var(--page); color: var(--ink); font-family: system-ui, sans-serif; }
+        .navbar-pdks { background: var(--surface); border-bottom: 1px solid var(--line); }
+        .card-s { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+        .section-title { font-size: .85rem; letter-spacing: .02em; color: var(--muted); text-transform: uppercase; }
+        table.compact td, table.compact th { padding: .45rem .5rem; font-size: .9rem; vertical-align: middle; }
+        a.p-sel { text-decoration: none; color: inherit; display: block; padding: .35rem .5rem; border-radius: 6px; }
+        a.p-sel:hover { background: var(--green-soft); }
+        a.p-sel.active { background: var(--green); color: #fff; }
+        .stat-box { background: var(--green-soft); border-radius: 8px; padding: .75rem; font-size: .9rem; }
     </style>
 </head>
 <body>
-<nav class="navbar navbar-expand-lg bg-dark border-bottom border-secondary-subtle sticky-top">
-    <div class="container-fluid">
-        <span class="navbar-brand text-light">PDKS Merkez Yönetim</span>
-        <a href="/logout" class="btn btn-outline-light btn-sm">Çıkış</a>
+<nav class="navbar navbar-pdks px-3 py-2 mb-3">
+    <span class="navbar-brand fw-semibold text-dark mb-0">PDKS · Yönetici</span>
+    <div class="d-flex gap-2 align-items-center">
+        <a class="btn btn-sm btn-outline-secondary" href="/personel" target="_blank">Personel ekranı</a>
+        <a class="btn btn-sm btn-outline-secondary" href="/rapor/excel">Mesai CSV</a>
+        <a class="btn btn-sm btn-outline-dark" href="/logout">Çıkış</a>
     </div>
 </nav>
 
-<div class="container-fluid py-3">
-    {% with messages = get_flashed_messages() %}
-        {% if messages %}
-            <div class="alert alert-success">{{ messages[0] }}</div>
+<div class="container-fluid px-3 pb-5">
+
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+        {% if msgs %}
+            {% for cat, msg in msgs %}
+                <div class="alert alert-{{ cat if cat in ['success','danger','info','warning'] else 'secondary' }} py-2 small">{{ msg }}</div>
+            {% endfor %}
         {% endif %}
     {% endwith %}
 
-    <div class="row g-3 mb-3">
-        <div class="col-12 col-md-4">
-            <div class="card stat-card p-3">
-                <div class="mini">Toplam Gelir</div>
-                <h4 id="income-total">{{ "%.2f"|format(total_income) }} TL</h4>
-            </div>
-        </div>
-        <div class="col-12 col-md-4">
-            <div class="card stat-card p-3">
-                <div class="mini">Toplam Gider</div>
-                <h4 id="expense-total">{{ "%.2f"|format(total_expense) }} TL</h4>
-            </div>
-        </div>
-        <div class="col-12 col-md-4">
-            <div class="card stat-card p-3">
-                <div class="mini">Net Bakiye</div>
-                <h4 id="net-total">{{ "%.2f"|format(net_balance) }} TL</h4>
-            </div>
-        </div>
-    </div>
-
     <div class="row g-3">
-        <div class="col-12 col-xl-4">
-            <div class="card section-card p-3 mb-3">
-                <h5>Şube Ekle</h5>
+        <div class="col-12 col-lg-4">
+
+            <div class="card-s p-3 mb-3">
+                <div class="section-title mb-2">Mağaza ekle</div>
                 <form method="post" class="row g-2">
                     <input type="hidden" name="action" value="add_branch">
-                    <div class="col-12"><input class="form-control" name="name" placeholder="Şube adı" required></div>
-                    <div class="col-12"><input class="form-control" name="code" placeholder="Opsiyonel sabit şube kodu"></div>
-                    <div class="col-6"><input type="time" class="form-control" name="shift_start" value="09:00" required></div>
-                    <div class="col-6"><input type="time" class="form-control" name="shift_end" value="18:00" required></div>
+                    {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
                     <div class="col-12">
-                        <input class="form-control" name="allowed_ip" placeholder="İsteğe bağlı: Şube çıkış IP (WAN), virgülle birden fazla örn: 212.174.x.x">
+                        <input class="form-control form-control-sm" name="name" placeholder="Mağaza adı" required>
                     </div>
-                    <div class="col-12 d-grid"><button class="btn btn-primary">Kaydet</button></div>
+                    <div class="col-12">
+                        <input class="form-control form-control-sm" name="allowed_ip"
+                               placeholder="Mağazanın çıkış IP adresi (virgülle birden fazla)" required>
+                    </div>
+                    <div class="col-12"><button type="submit" class="btn btn-sm text-white w-100" style="background:var(--green)">Kaydet</button></div>
                 </form>
             </div>
 
-            <div class="card section-card p-3 mb-3">
-                <h5>Personel Ekle</h5>
+            <div class="card-s p-3 mb-3">
+                <div class="section-title mb-2">Personel ekle</div>
                 <form method="post" class="row g-2">
                     <input type="hidden" name="action" value="add_personnel">
-                    <div class="col-12"><input class="form-control" name="full_name" placeholder="Ad Soyad" required></div>
+                    {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                    <div class="col-12"><input class="form-control form-control-sm" name="full_name" placeholder="Ad soyad" required></div>
                     <div class="col-12">
-                        <select class="form-select" name="branch_id" required>
-                            <option value="">Şube seçiniz</option>
+                        <select class="form-select form-select-sm" name="branch_id" required>
+                            <option value="">Mağaza</option>
                             {% for b in branches %}
+                                {% if b['active'] %}
                                 <option value="{{ b.id }}">{{ b.name }}</option>
+                                {% endif %}
                             {% endfor %}
                         </select>
                     </div>
-                    <div class="col-12"><input type="number" step="0.01" class="form-control" name="monthly_salary" placeholder="Aylık maaş (TL)" required></div>
-                    <div class="col-12 d-grid"><button class="btn btn-success">Personel Kaydet</button></div>
+                    <div class="col-12"><button type="submit" class="btn btn-sm btn-outline-dark w-100">Ekle</button></div>
                 </form>
             </div>
 
-            <div class="card section-card p-3 mb-3">
-                <h5>Avans Ekle</h5>
-                <form method="post" class="row g-2">
-                    <input type="hidden" name="action" value="add_advance">
-                    <div class="col-12">
-                        <select class="form-select" name="personnel_id" required>
-                            <option value="">Personel seçiniz</option>
-                            {% for p in personnel %}
-                                <option value="{{ p.id }}">{{ p.full_name }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="col-12"><input type="number" class="form-control" step="0.01" name="amount" placeholder="Avans tutarı" required></div>
-                    <div class="col-12"><input class="form-control" name="note" placeholder="Açıklama"></div>
-                    <div class="col-12 d-grid"><button class="btn btn-warning">Avans Kaydet</button></div>
-                </form>
-            </div>
-
-            <div class="card section-card p-3">
-                <h5>Duyuru Panosu</h5>
-                {% if latest_note %}
-                    <div class="alert alert-info py-2">{{ latest_note.content }}</div>
-                {% endif %}
-                <form method="post" class="row g-2">
+            <div class="card-s p-3 mb-3">
+                <div class="section-title mb-2">Duyuru</div>
+                <form method="post">
                     <input type="hidden" name="action" value="add_note">
-                    <div class="col-12">
-                        <textarea class="form-control" name="content" rows="3" placeholder="Yönetici notu..." required></textarea>
-                    </div>
-                    <div class="col-12 d-grid"><button class="btn btn-outline-light">Duyuru Yayınla</button></div>
+                    {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                    <textarea class="form-control form-control-sm mb-2" name="content" rows="2" placeholder="Personelde görünsün..." required></textarea>
+                    <button type="submit" class="btn btn-sm btn-outline-secondary w-100">Yayınla</button>
                 </form>
+                {% if latest_notes %}
+                    <hr class="my-2 opacity-25">
+                    <div class="small text-muted">
+                        {% for n in latest_notes %}
+                            <div class="mb-2">{{ n.content }} <span class="text-secondary">{{ n.created_at[:16] }}</span></div>
+                        {% endfor %}
+                    </div>
+                {% endif %}
+            </div>
+
+            <div class="card-s p-3">
+                <div class="section-title mb-2">Mağaza listesi</div>
+                <div class="table-responsive">
+                    <table class="table table-sm compact mb-0">
+                        <thead><tr><th>Ad</th><th>IP</th><th></th></tr></thead>
+                        <tbody>
+                        {% for b in branches %}
+                            <tr class="{{ 'table-secondary opacity-75' if not b['active'] else '' }}">
+                                <td>{{ b.name }}</td>
+                                <td colspan="2" class="p-1">
+                                    <form method="post" class="d-flex gap-1 flex-wrap">
+                                        <input type="hidden" name="action" value="set_branch_ip">
+                                        <input type="hidden" name="branch_id" value="{{ b.id }}">
+                                        {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                                        <input class="form-control form-control-sm flex-grow-1" name="allowed_ip" value="{{ b['allowed_ip'] or '' }}" style="min-width:120px" placeholder="IP">
+                                        <button type="submit" class="btn btn-sm btn-outline-secondary">Güncelle</button>
+                                    </form>
+                                    {% if b['active'] %}
+                                    <form method="post" class="mt-1" onsubmit="return confirm('Bu mağazayı kapatmak istediğinize emin misiniz?');">
+                                        <input type="hidden" name="action" value="deactivate_branch">
+                                        <input type="hidden" name="branch_id" value="{{ b.id }}">
+                                        {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                                        <button type="submit" class="btn btn-link btn-sm text-danger p-0">Mağazayı kapat</button>
+                                    </form>
+                                    {% else %}
+                                        <span class="small text-muted">Kapalı</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card-s p-3 mt-3">
+                <div class="section-title mb-2">Personel</div>
+                <div class="small text-muted mb-2">Pasif etmek için tıklayın; bir isme tıklayınca yalnızca o çalışanın özeti görünür.</div>
+                {% for p in personnel %}
+                    {% if p['active'] %}
+                    <div class="d-flex align-items-center justify-content-between gap-2 py-1 border-bottom border-opacity-25">
+                        <a class="p-sel {{ 'active' if selected_pid == p.id else '' }} flex-grow-1" href="{{ url_for('admin', pid=p.id) }}">{{ p.full_name }}</a>
+                        <span class="text-muted small">{{ p.branch_name }}</span>
+                        <form method="post" class="mb-0" onsubmit="return confirm('Personeli pasif yapalım mı?');">
+                            <input type="hidden" name="action" value="deactivate_personnel">
+                            <input type="hidden" name="personnel_id" value="{{ p.id }}">
+                            {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                            <button type="submit" class="btn btn-sm btn-link text-danger p-0">Pasif</button>
+                        </form>
+                    </div>
+                    {% endif %}
+                {% endfor %}
+                <div class="section-title mt-3 mb-1">Pasif</div>
+                {% for p in personnel %}
+                    {% if not p['active'] %}
+                    <div class="small text-muted py-1">{{ p.full_name }} · {{ p.branch_name }}</div>
+                    {% endif %}
+                {% endfor %}
             </div>
         </div>
 
-        <div class="col-12 col-xl-8">
-            <div class="card section-card p-3 mb-3">
-                <h5>Gelir / Gider Ekle</h5>
-                <form method="post" class="row g-2" id="finance-form">
-                    <input type="hidden" name="action" value="add_finance">
-                    <input type="hidden" name="uid" id="uid-field">
-                    <div class="col-12 col-md-3">
-                        <select class="form-select" name="entry_type" required>
-                            <option value="income">Gelir</option>
-                            <option value="expense">Gider</option>
-                        </select>
+        <div class="col-12 col-lg-8">
+            {% if sel_stats and sel_name %}
+            <div class="card-s p-3 mb-3">
+                <div class="d-flex justify-content-between align-items-start">
+                    <div>
+                        <div class="section-title">Seçilen personel</div>
+                        <div class="h5 mb-3">{{ sel_name }}</div>
                     </div>
-                    <div class="col-12 col-md-3"><input class="form-control" type="number" step="0.01" name="amount" placeholder="Miktar" required></div>
-                    <div class="col-12 col-md-3"><input class="form-control" name="category" placeholder="Kategori" required></div>
-                    <div class="col-12 col-md-3"><input class="form-control" type="date" name="entry_date"></div>
-                    <div class="col-12"><input class="form-control" name="description" placeholder="Açıklama"></div>
-                    <div class="col-12 d-grid"><button class="btn btn-primary">Kaydet</button></div>
-                </form>
-            </div>
-
-            <div class="row g-3 mb-3">
-                <div class="col-12 col-lg-7">
-                    <div class="card section-card p-3">
-                        <h6>Haftalık Gelir/Gider Trendi</h6>
-                        <canvas id="lineChart" height="120"></canvas>
-                    </div>
+                    <a href="{{ url_for('admin') }}" class="small text-muted">Temizle</a>
                 </div>
-                <div class="col-12 col-lg-5">
-                    <div class="card section-card p-3">
-                        <h6>Gider Kategorileri</h6>
-                        <canvas id="pieChart" height="120"></canvas>
-                    </div>
-                </div>
-            </div>
-
-            <div class="card section-card p-3 mb-3">
-                <div class="d-flex justify-content-between align-items-center">
-                    <h5 class="mb-0">Canlı Mesai Tablosu</h5>
-                    <a class="btn btn-outline-success btn-sm" href="/rapor/excel">Excel İndir</a>
-                </div>
-                <div class="table-responsive mt-3">
-                    <table class="table table-striped table-hover align-middle">
-                        <thead>
-                        <tr>
-                            <th>İsim</th>
-                            <th>Şube</th>
-                            <th>Tarih</th>
-                            <th>Giriş-Çıkış Saati</th>
-                            <th>Süre</th>
-                        </tr>
-                        </thead>
-                        <tbody>
-                        {% for row in attendance_rows %}
-                            <tr>
-                                <td>{{ row.full_name }}</td>
-                                <td>{{ row.branch_name }}</td>
-                                <td>{{ row.date }}</td>
-                                <td>{{ row.checkin_at or "-" }} / {{ row.checkout_at or "-" }}</td>
-                                <td>{{ row.duration_minutes }} dk</td>
-                            </tr>
-                        {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card section-card p-3 mb-3">
-                <h5>Otomatik Bordro ({{ month_start }})</h5>
-                <div class="table-responsive">
-                    <table class="table table-sm table-bordered align-middle">
-                        <thead>
-                        <tr>
-                            <th>Personel</th>
-                            <th>Şube</th>
-                            <th>Aylık Maaş</th>
-                            <th>Çalışma Saati</th>
-                            <th>Hak Ediş (oransal)</th>
-                            <th>Avans</th>
-                            <th>Ödenecek</th>
-                        </tr>
-                        </thead>
-                        <tbody>
-                        {% for p in payroll %}
-                            {% set worked_hours = (p.worked_minutes / 60) %}
-                            {% set proportional = (p.monthly_salary * (worked_hours / 225)) %}
-                            {% set payable = proportional - p.total_advance %}
-                            <tr>
-                                <td>{{ p.full_name }}</td>
-                                <td>{{ p.branch_name }}</td>
-                                <td>{{ "%.2f"|format(p.monthly_salary) }} TL</td>
-                                <td>{{ "%.2f"|format(worked_hours) }}</td>
-                                <td>{{ "%.2f"|format(proportional if proportional > 0 else 0) }} TL</td>
-                                <td>{{ "%.2f"|format(p.total_advance) }} TL</td>
-                                <td>{{ "%.2f"|format(payable if payable > 0 else 0) }} TL</td>
-                            </tr>
-                        {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card section-card p-3 mb-3">
-                <h5>Şube IP kısıtı (personel ekranı)</h5>
-                <p class="small text-secondary mb-2">
-                    Boş bırakırsanız sadece <strong>dinamik kod</strong> yeterli. IP yazarsanız personel telefonu o IP’den gelmek zorunda (virgülle birden fazla).
-                    Not: Mobil veri IP’si sık değişir; mağaza <strong>WIFI / sabit hat</strong> için uygundur.
-                </p>
-                {% for b in branches %}
-                    <form method="post" class="row g-2 align-items-center mb-2 border-bottom border-secondary pb-2">
-                        <input type="hidden" name="action" value="set_branch_allowed_ip">
-                        <input type="hidden" name="branch_id" value="{{ b.id }}">
-                        <div class="col-12 col-md-3 small text-light fw-semibold">{{ b.name }}</div>
-                        <div class="col-12 col-md-7">
-                            <input class="form-control form-control-sm" name="allowed_ip" value="{{ b['allowed_ip'] if b['allowed_ip'] else '' }}"
-                                   placeholder="örn: 85.xx.xx.xx veya iki IP virgülle">
-                        </div>
-                        <div class="col-12 col-md-2">
-                            <button type="submit" class="btn btn-sm btn-outline-light w-100">IP kaydet</button>
-                        </div>
-                    </form>
-                {% endfor %}
-            </div>
-
-            <div class="card section-card p-3">
-                <h5>Şubeler ve Dinamik Kod Ekran Linkleri</h5>
                 <div class="row g-2">
-                    {% for b in branches %}
-                        <div class="col-12 col-md-6">
-                            <a class="btn btn-outline-info w-100" target="_blank" href="/sube/{{ b.id }}/ekran">
-                                {{ b.name }} /sube/{{ b.id }}/ekran
-                            </a>
+                    <div class="col-md-4">
+                        <div class="stat-box">
+                            <div class="text-muted small">Bugün</div>
+                            <div class="fs-5 fw-semibold">{{ sel_stats.today_hours }} saat</div>
                         </div>
-                    {% endfor %}
+                    </div>
+                    <div class="col-md-4">
+                        <div class="stat-box">
+                            <div class="text-muted small">Bu hafta (Pzt–Paz)</div>
+                            <div class="fs-6 fw-semibold">{{ sel_stats.week_days }} gün</div>
+                            <div>{{ sel_stats.week_hours }} saat</div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="stat-box">
+                            <div class="text-muted small">Bu ay</div>
+                            <div class="fs-6 fw-semibold">{{ sel_stats.month_days }} gün</div>
+                            <div>{{ sel_stats.month_hours }} saat</div>
+                        </div>
+                    </div>
+                </div>
+                <p class="small text-muted mt-2 mb-0">Çalışma süresi, tamamlanan kayıtlar ve (bugün ise) açık vardiyanın süresine göre hesaplanır.</p>
+            </div>
+            {% else %}
+            <div class="card-s p-3 mb-3 text-muted small">
+                Soldan aktif bir personel adına tıklayın; yalnızca o kişinin bugün / bu hafta / bu ay özeti burada görünecek.
+            </div>
+            {% endif %}
+
+            <div class="card-s p-3">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span class="section-title mb-0">Canlı mesai</span>
+                </div>
+                <div class="table-responsive" style="max-height:520px;overflow:auto">
+                    <table class="table table-sm compact table-hover mb-0">
+                        <thead class="sticky-top bg-white shadow-sm"><tr><th>İsim</th><th>Mağaza</th><th>Gün</th><th>Giriş</th><th>Çıkış</th><th>Dk</th></tr></thead>
+                        <tbody>
+                        {% for a in attendance_rows %}
+                            <tr>
+                                <td><a href="{{ url_for('admin', pid=a.personnel_id) }}">{{ a.full_name }}</a></td>
+                                <td>{{ a.branch_name }}</td>
+                                <td>{{ a.date }}</td>
+                                <td>{{ a.checkin_at or '—' }}</td>
+                                <td>{{ a.checkout_at or '—' }}</td>
+                                <td>{{ a.duration_minutes }} dk</td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="6" class="text-muted">Kayıt yok</td></tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
     </div>
 </div>
-
-<script>
-    document.getElementById("uid-field").value = crypto.randomUUID();
-
-    const dbKey = "pdks_finans_local";
-    const financeForm = document.getElementById("finance-form");
-
-    financeForm.addEventListener("submit", () => {
-        const formData = new FormData(financeForm);
-        const payload = {
-            uid: formData.get("uid"),
-            entry_type: formData.get("entry_type"),
-            amount: parseFloat(formData.get("amount") || "0"),
-            category: formData.get("category"),
-            description: formData.get("description"),
-            entry_date: formData.get("entry_date") || new Date().toISOString().slice(0, 10)
-        };
-        const local = JSON.parse(localStorage.getItem(dbKey) || "[]");
-        local.push(payload);
-        localStorage.setItem(dbKey, JSON.stringify(local));
-    });
-
-    async function syncFinance() {
-        const localEntries = JSON.parse(localStorage.getItem(dbKey) || "[]");
-        const res = await fetch("/api/finance/sync", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({entries: localEntries})
-        });
-        const data = await res.json();
-        if (data.ok) {
-            localStorage.setItem(dbKey, JSON.stringify(data.entries));
-        }
-    }
-
-    let lineChart;
-    let pieChart;
-    async function refreshDashboard() {
-        const res = await fetch("/api/dashboard");
-        const data = await res.json();
-        if (!data.ok) return;
-
-        document.getElementById("income-total").textContent = `${data.totals.income.toFixed(2)} TL`;
-        document.getElementById("expense-total").textContent = `${data.totals.expense.toFixed(2)} TL`;
-        document.getElementById("net-total").textContent = `${data.totals.net.toFixed(2)} TL`;
-
-        const labels = data.weekly.map(x => x.date.slice(5));
-        const income = data.weekly.map(x => x.income);
-        const expense = data.weekly.map(x => x.expense);
-
-        if (lineChart) lineChart.destroy();
-        lineChart = new Chart(document.getElementById("lineChart"), {
-            type: "line",
-            data: {
-                labels,
-                datasets: [
-                    {label: "Gelir", data: income, borderColor: "#22c55e", tension: 0.35},
-                    {label: "Gider", data: expense, borderColor: "#ef4444", tension: 0.35}
-                ]
-            }
-        });
-
-        if (pieChart) pieChart.destroy();
-        pieChart = new Chart(document.getElementById("pieChart"), {
-            type: "pie",
-            data: {
-                labels: Object.keys(data.expense_by_category),
-                datasets: [{data: Object.values(data.expense_by_category)}]
-            }
-        });
-    }
-
-    syncFinance().then(refreshDashboard);
-</script>
 </body>
 </html>

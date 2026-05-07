@@ -24,11 +24,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "pdks-local-dev-change-me")
 
-# SQLite: Render'da kalıcı disk kullanırsanız Environment Variable ile örn.
-# DATABASE_PATH=/var/data/pdks_merkez.db
 DATABASE = os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "pdks_merkez.db"))
-
-CODE_SECRET = os.environ.get("CODE_SECRET", "dynamic-code-secret-branch-2026")
 
 _RENDER_HOSTED = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
 if _RENDER_HOSTED:
@@ -72,6 +68,7 @@ def init_db():
             shift_start TEXT NOT NULL DEFAULT '09:00',
             shift_end TEXT NOT NULL DEFAULT '18:00',
             allowed_ip TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         );
 
@@ -98,27 +95,6 @@ def init_db():
             FOREIGN KEY (branch_id) REFERENCES branches(id)
         );
 
-        CREATE TABLE IF NOT EXISTS advances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            personnel_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            note TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (personnel_id) REFERENCES personnel(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS finance_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid TEXT NOT NULL UNIQUE,
-            entry_type TEXT NOT NULL CHECK(entry_type IN ('income', 'expense')),
-            amount REAL NOT NULL,
-            category TEXT NOT NULL,
-            description TEXT,
-            entry_date TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'db',
-            created_at TEXT NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
@@ -132,14 +108,20 @@ def init_db():
         """
     )
     db.commit()
-    _ensure_branch_allowed_ip_column(db)
+    _migrate_schema(db)
 
 
-def _ensure_branch_allowed_ip_column(db):
-    names = [r["name"] for r in db.execute("PRAGMA table_info(branches)").fetchall()]
-    if "allowed_ip" not in names:
+def _migrate_schema(db):
+    bcols = [r["name"] for r in db.execute("PRAGMA table_info(branches)").fetchall()]
+    if "allowed_ip" not in bcols:
         db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
         db.commit()
+        bcols.append("allowed_ip")
+    if "active" not in bcols:
+        db.execute("ALTER TABLE branches ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        db.commit()
+    db.execute("UPDATE branches SET active = 1 WHERE active IS NULL")
+    db.commit()
 
 
 @app.before_request
@@ -162,18 +144,18 @@ def get_client_ip():
     return (request.remote_addr or "").strip()
 
 
-def branch_ip_allowed(branch_row, client_ip: str) -> bool:
-    if not branch_row:
-        return True
+def store_ip_status(branch_row, client_ip: str) -> tuple:
+    raw = ""
     try:
-        allowed_raw = branch_row["allowed_ip"]
-    except (KeyError, IndexError, TypeError):
-        return True
-    allowed = (allowed_raw or "").strip()
+        raw = branch_row["allowed_ip"] if branch_row else ""
+    except (KeyError, TypeError):
+        raw = ""
+    allowed = (raw or "").strip()
     if not allowed:
-        return True
-    allowed_list = [x.strip() for x in allowed.split(",") if x.strip()]
-    return client_ip in allowed_list
+        return False, "magaza_ipsiz"
+    lst = [x.strip() for x in allowed.split(",") if x.strip()]
+    ok = client_ip in lst
+    return ok, "ok" if ok else "nomatch"
 
 
 def get_setting(key: str):
@@ -207,29 +189,113 @@ def verify_password(password: str):
     return hmac.compare_digest(stored_hash, entered_hash)
 
 
-def generate_dynamic_code(branch_id: int):
-    window = int(datetime.now().timestamp() // 20)
-    payload = f"{branch_id}:{window}".encode("utf-8")
-    digest = hmac.new(CODE_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-    code_number = int(digest[:8], 16) % 1000000
-    return f"{code_number:06d}"
-
-
-def fetch_branches():
+def fetch_branches(active_only=False):
     db = get_db()
-    return db.execute("SELECT * FROM branches ORDER BY name").fetchall()
+    q = "SELECT * FROM branches"
+    if active_only:
+        q += " WHERE active = 1"
+    q += " ORDER BY active DESC, name"
+    return db.execute(q).fetchall()
 
 
-def fetch_personnel():
+def fetch_personnel_for_public():
     db = get_db()
     return db.execute(
         """
         SELECT p.*, b.name AS branch_name
         FROM personnel p
         JOIN branches b ON b.id = p.branch_id
+        WHERE p.active = 1 AND b.active = 1
         ORDER BY p.full_name
         """
     ).fetchall()
+
+
+def fetch_personnel_admin():
+    db = get_db()
+    return db.execute(
+        """
+        SELECT p.*, b.name AS branch_name
+        FROM personnel p
+        JOIN branches b ON b.id = p.branch_id
+        ORDER BY p.active DESC, p.full_name
+        """
+    ).fetchall()
+
+
+def _parse_ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _minutes_between(start_dt, end_dt):
+    return max(0, int((end_dt - start_dt).total_seconds() // 60))
+
+
+def personnel_work_stats(db, personnel_id: int):
+    rows = db.execute(
+        """
+        SELECT date, checkin_at, checkout_at, duration_minutes
+        FROM attendance WHERE personnel_id = ? ORDER BY id
+        """,
+        (personnel_id,),
+    ).fetchall()
+
+    now = datetime.now()
+    today_s = now.strftime("%Y-%m-%d")
+    mon_start = now.replace(day=1).date()
+    week_start_date = now.date() - timedelta(days=(now.weekday()))
+    week_end_date = week_start_date + timedelta(days=6)
+
+    def contrib_minutes_day(iso_day: str):
+        total = 0
+        for r in rows:
+            if r["date"] != iso_day:
+                continue
+            if r["checkout_at"]:
+                total += int(r["duration_minutes"] or 0)
+            elif r["checkin_at"]:
+                ci = _parse_ts(r["checkin_at"])
+                if ci:
+                    total += _minutes_between(ci, now)
+        return total
+
+    today_minutes = contrib_minutes_day(today_s)
+
+    weekly_minutes = 0
+    weekly_days = set()
+    cur = week_start_date
+    while cur <= week_end_date:
+        iso = cur.strftime("%Y-%m-%d")
+        m = contrib_minutes_day(iso)
+        if m > 0:
+            weekly_minutes += m
+            weekly_days.add(iso)
+        cur += timedelta(days=1)
+
+    monthly_minutes = 0
+    monthly_days = set()
+    cur = mon_start
+    while cur.year == now.year and cur.month == now.month and cur <= now.date():
+        iso = cur.strftime("%Y-%m-%d")
+        m = contrib_minutes_day(iso)
+        if m > 0:
+            monthly_minutes += m
+            monthly_days.add(iso)
+        cur += timedelta(days=1)
+
+    def fmt_h(m):
+        return round(m / 60.0, 2)
+
+    return {
+        "today_hours": fmt_h(today_minutes),
+        "week_days": len(weekly_days),
+        "week_hours": fmt_h(weekly_minutes),
+        "month_days": len(monthly_days),
+        "month_hours": fmt_h(monthly_minutes),
+    }
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -249,9 +315,9 @@ def index():
             password = request.form.get("password", "").strip()
             confirm_password = request.form.get("confirm_password", "").strip()
             if len(password) < 4:
-                flash("Sifre en az 4 karakter olmali.", "danger")
+                flash("Şifre en az 4 karakter olmalı.", "danger")
             elif password != confirm_password:
-                flash("Sifre ve tekrar sifre ayni olmali.", "danger")
+                flash("Şifre ile tekrar eşleşmiyor.", "danger")
             else:
                 set_setting("admin_password_hash", hash_password(password))
                 session["is_admin"] = True
@@ -262,7 +328,7 @@ def index():
             if verify_password(password):
                 session["is_admin"] = True
                 return redirect_after_admin_login(next_url)
-            flash("Yonetici sifresi hatali.", "danger")
+            flash("Yönetici şifresi hatalı.", "danger")
 
     return render_template("index.html", mode=mode, next=next_url)
 
@@ -276,10 +342,7 @@ def logout():
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     if not require_admin():
-        flash(
-            "Yönetim paneli korumalıdır. Önce şifre ile giriş yapın; ardından tam yönetim ekranı açılır.",
-            "info",
-        )
+        flash("Önce giriş yapın.", "info")
         return redirect(url_for("index", next=request.path))
 
     db = get_db()
@@ -288,60 +351,66 @@ def admin():
         action = request.form.get("action", "")
 
         if action == "add_branch":
-            allowed_ip = request.form.get("allowed_ip", "").strip() or None
+            name = request.form["name"].strip()
+            allowed_ip = request.form.get("allowed_ip", "").strip()
+            if not allowed_ip:
+                flash("Mağaza için internet çıkış IP adresi zorunludur.", "danger")
+            else:
+                try:
+                    db.execute(
+                        """
+                        INSERT INTO branches (name, code, shift_start, shift_end, allowed_ip, active, created_at)
+                        VALUES (?, NULL, '09:00', '18:00', ?, 1, ?)
+                        """,
+                        (name, allowed_ip, now_str()),
+                    )
+                    db.commit()
+                    flash("Mağaza eklendi.", "success")
+                except sqlite3.IntegrityError:
+                    flash("Bu isimde mağaza zaten var.", "danger")
+
+        elif action == "deactivate_branch":
+            bid = int(request.form["branch_id"])
+            db.execute("UPDATE branches SET active = 0 WHERE id = ?", (bid,))
             db.execute(
-                """
-                INSERT INTO branches (name, code, shift_start, shift_end, allowed_ip, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    request.form["name"].strip(),
-                    request.form.get("code", "").strip() or None,
-                    request.form.get("shift_start", "09:00"),
-                    request.form.get("shift_end", "18:00"),
-                    allowed_ip,
-                    now_str(),
-                ),
+                "UPDATE personnel SET active = 0 WHERE branch_id = ?",
+                (bid,),
             )
             db.commit()
-            flash("Sube eklendi.")
+            flash("Mağaza kapatıldı; bağlı personel de pasif edildi.", "success")
 
-        elif action == "set_branch_allowed_ip":
+        elif action == "set_branch_ip":
             bid = int(request.form["branch_id"])
             raw = request.form.get("allowed_ip", "").strip()
-            val = raw if raw else None
-            db.execute("UPDATE branches SET allowed_ip = ? WHERE id = ?", (val, bid))
-            db.commit()
-            flash("Sube IP kisiti guncellendi.")
+            if not raw:
+                flash("IP alanı boş bırakılamaz.", "danger")
+            else:
+                db.execute("UPDATE branches SET allowed_ip = ? WHERE id = ?", (raw, bid))
+                db.commit()
+                flash("Mağaza IP güncellendi.", "success")
 
         elif action == "add_personnel":
             db.execute(
                 """
-                INSERT INTO personnel (full_name, branch_id, monthly_salary, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO personnel (full_name, branch_id, monthly_salary, active, created_at)
+                VALUES (?, ?, 0, 1, ?)
                 """,
                 (
                     request.form["full_name"].strip(),
                     int(request.form["branch_id"]),
-                    float(request.form["monthly_salary"]),
                     now_str(),
                 ),
             )
             db.commit()
-            flash("Personel eklendi.")
+            flash("Personel eklendi.", "success")
 
-        elif action == "add_advance":
+        elif action == "deactivate_personnel":
             db.execute(
-                "INSERT INTO advances (personnel_id, amount, note, created_at) VALUES (?, ?, ?, ?)",
-                (
-                    int(request.form["personnel_id"]),
-                    float(request.form["amount"]),
-                    request.form.get("note", "").strip(),
-                    now_str(),
-                ),
+                "UPDATE personnel SET active = 0 WHERE id = ?",
+                (int(request.form["personnel_id"]),),
             )
             db.commit()
-            flash("Avans kaydi eklendi.")
+            flash("Personel pasif yapıldı.", "success")
 
         elif action == "add_note":
             content = request.form.get("content", "").strip()
@@ -351,32 +420,15 @@ def admin():
                     (content, now_str()),
                 )
                 db.commit()
-                flash("Duyuru yayinlandi.")
+                flash("Duyuru kaydedildi.", "success")
 
-        elif action == "add_finance":
-            db.execute(
-                """
-                INSERT OR IGNORE INTO finance_entries
-                (uid, entry_type, amount, category, description, entry_date, source, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'admin_form', ?)
-                """,
-                (
-                    request.form.get("uid", os.urandom(6).hex()),
-                    request.form["entry_type"],
-                    float(request.form["amount"]),
-                    request.form["category"].strip(),
-                    request.form.get("description", "").strip(),
-                    request.form.get("entry_date") or datetime.now().strftime("%Y-%m-%d"),
-                    now_str(),
-                ),
-            )
-            db.commit()
-            flash("Gelir/Gider kaydi eklendi.")
-
+        return_pid = request.form.get("return_pid", type=int)
+        if return_pid:
+            return redirect(url_for("admin", pid=return_pid))
         return redirect(url_for("admin"))
 
-    branches = fetch_branches()
-    personnel = fetch_personnel()
+    branches = fetch_branches(active_only=False)
+    personnel_admin = fetch_personnel_admin()
 
     attendance_rows = db.execute(
         """
@@ -384,83 +436,63 @@ def admin():
         FROM attendance a
         JOIN personnel p ON p.id = a.personnel_id
         JOIN branches b ON b.id = a.branch_id
-        ORDER BY a.id DESC
-        LIMIT 300
+        ORDER BY COALESCE(a.checkout_at, a.checkin_at) DESC, a.id DESC
+        LIMIT 200
         """
     ).fetchall()
 
-    month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    payroll = db.execute(
-        """
-        SELECT
-            p.id,
-            p.full_name,
-            p.monthly_salary,
-            b.name AS branch_name,
-            COALESCE(SUM(a.duration_minutes), 0) AS worked_minutes,
-            (
-                SELECT COALESCE(SUM(amount), 0)
-                FROM advances av
-                WHERE av.personnel_id = p.id
-                AND substr(av.created_at, 1, 7) = ?
-            ) AS total_advance
-        FROM personnel p
-        JOIN branches b ON b.id = p.branch_id
-        LEFT JOIN attendance a
-            ON a.personnel_id = p.id
-            AND a.checkin_at >= ?
-            AND a.checkin_at IS NOT NULL
-        GROUP BY p.id
-        ORDER BY p.full_name
-        """,
-        (month_start.strftime("%Y-%m"), month_start.strftime("%Y-%m-%d %H:%M:%S")),
+    latest_notes = db.execute(
+        "SELECT content, created_at FROM announcements ORDER BY id DESC LIMIT 5"
     ).fetchall()
 
-    finance_rows = db.execute(
-        "SELECT * FROM finance_entries ORDER BY entry_date DESC, id DESC LIMIT 500"
-    ).fetchall()
-
-    total_income = sum(x["amount"] for x in finance_rows if x["entry_type"] == "income")
-    total_expense = sum(x["amount"] for x in finance_rows if x["entry_type"] == "expense")
-    latest_note = db.execute(
-        "SELECT content, created_at FROM announcements ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    selected_pid = request.args.get("pid", type=int)
+    sel_stats = None
+    sel_name = None
+    if selected_pid:
+        prow = db.execute(
+            "SELECT full_name FROM personnel WHERE id = ?",
+            (selected_pid,),
+        ).fetchone()
+        if prow:
+            sel_name = prow["full_name"]
+            sel_stats = personnel_work_stats(db, selected_pid)
 
     return render_template(
         "admin.html",
         branches=branches,
-        personnel=personnel,
+        personnel=personnel_admin,
         attendance_rows=attendance_rows,
-        payroll=payroll,
-        finance_rows=finance_rows,
-        total_income=total_income,
-        total_expense=total_expense,
-        net_balance=total_income - total_expense,
-        latest_note=latest_note,
-        month_start=month_start.strftime("%Y-%m"),
+        latest_notes=latest_notes,
+        selected_pid=selected_pid,
+        sel_name=sel_name,
+        sel_stats=sel_stats,
     )
 
 
-@app.route("/sube/<int:branch_id>/ekran")
-def branch_screen(branch_id):
+@app.route("/personel")
+def personel():
     db = get_db()
-    branch = db.execute("SELECT * FROM branches WHERE id = ?", (branch_id,)).fetchone()
-    if not branch:
-        return "Sube bulunamadi.", 404
-    return render_template("ekran.html", branch=branch, code=generate_dynamic_code(branch_id))
-
-
-@app.route("/tara")
-def tara():
-    db = get_db()
-    branches = fetch_branches()
-    personnel = fetch_personnel()
+    branches = fetch_branches(active_only=True)
+    personnel_rows = fetch_personnel_for_public()
     latest_note = db.execute(
         "SELECT content, created_at FROM announcements ORDER BY id DESC LIMIT 1"
     ).fetchone()
     return render_template(
-        "tara.html", branches=branches, personnel=personnel, latest_note=latest_note
+        "personel.html",
+        branches=branches,
+        personnel=personnel_rows,
+        latest_note=latest_note,
     )
+
+
+@app.route("/tara")
+def tara_legacy():
+    return redirect(url_for("personel"))
+
+
+@app.route("/sube/<int:branch_id>/ekran")
+def branch_screen(branch_id):
+    return redirect(url_for("personel"))
 
 
 @app.get("/api/personnel-durum")
@@ -469,10 +501,10 @@ def api_personnel_status():
         personnel_id = int(request.args.get("personnel_id", "0"))
         branch_id = int(request.args.get("branch_id", "0"))
     except ValueError:
-        return jsonify({"ok": False, "message": "Gecersiz parametre"}), 400
+        return jsonify({"ok": False, "message": "Geçersiz parametre"}), 400
 
     if not personnel_id or not branch_id:
-        return jsonify({"ok": False, "message": "Personel ve sube secilmeli"}), 400
+        return jsonify({"ok": False, "message": "Mağaza ve personeli seçin."}), 400
 
     db = get_db()
     person = db.execute(
@@ -480,18 +512,27 @@ def api_personnel_status():
         (personnel_id,),
     ).fetchone()
     if not person:
-        return jsonify({"ok": False, "message": "Personel bulunamadi"}), 404
+        return jsonify({"ok": False, "message": "Personel bulunamadı veya kapalı mağaza."}), 404
     if person["branch_id"] != branch_id:
-        return jsonify({"ok": False, "message": "Bu personel secilen subeye bagli degil"}), 400
+        return jsonify({"ok": False, "message": "Bu personel seçilen mağazaya bağlı değil."}), 400
 
-    branch = db.execute("SELECT * FROM branches WHERE id = ?", (branch_id,)).fetchone()
+    branch = db.execute("SELECT * FROM branches WHERE id = ? AND active = 1", (branch_id,)).fetchone()
     if not branch:
-        return jsonify({"ok": False, "message": "Sube bulunamadi"}), 404
+        return jsonify({"ok": False, "message": "Mağaza kapalı."}), 404
 
     client_ip = get_client_ip()
-    allowed_raw = (branch["allowed_ip"] or "").strip()
-    ip_check_enabled = bool(allowed_raw)
-    ip_ok = branch_ip_allowed(branch, client_ip)
+    ip_ok, reason = store_ip_status(branch, client_ip)
+
+    if reason == "magaza_ipsiz":
+        return jsonify(
+            {
+                "ok": True,
+                "next_action": "blocked",
+                "client_ip": client_ip,
+                "ip_ok": False,
+                "message": "Bu mağaza için yöneticinin tanımladığı çıkış IP henüz yok; işlem kapalıdır.",
+            }
+        )
 
     open_record = db.execute(
         """
@@ -503,14 +544,19 @@ def api_personnel_status():
     ).fetchone()
     next_action = "out" if open_record else "in"
 
+    if not ip_ok:
+        return jsonify(
+            {
+                "ok": True,
+                "next_action": "blocked",
+                "client_ip": client_ip,
+                "ip_ok": False,
+                "message": "Bu işlem için mağaza internetine (tanımlı IP) bağlı olmanız gerekir.",
+            }
+        )
+
     return jsonify(
-        {
-            "ok": True,
-            "next_action": next_action,
-            "client_ip": client_ip,
-            "ip_check_enabled": ip_check_enabled,
-            "ip_ok": ip_ok,
-        }
+        {"ok": True, "next_action": next_action, "client_ip": client_ip, "ip_ok": True}
     )
 
 
@@ -520,28 +566,27 @@ def api_punch():
     personnel_id = int(request.form["personnel_id"])
     branch_id = int(request.form["branch_id"])
     action = request.form["action"]
-    code = request.form["code"].strip()
 
-    if code != generate_dynamic_code(branch_id):
-        return jsonify({"ok": False, "message": "Kod gecersiz veya suresi doldu."}), 400
-
-    branch = db.execute("SELECT * FROM branches WHERE id = ?", (branch_id,)).fetchone()
+    branch = db.execute(
+        "SELECT * FROM branches WHERE id = ? AND active = 1", (branch_id,)
+    ).fetchone()
     if not branch:
-        return jsonify({"ok": False, "message": "Sube bulunamadi."}), 404
+        return jsonify({"ok": False, "message": "Mağaza bulunamadı."}), 404
 
     client_ip = get_client_ip()
-    if not branch_ip_allowed(branch, client_ip):
-        allowed_hint = (branch["allowed_ip"] or "").strip()
+    ip_ok, reason = store_ip_status(branch, client_ip)
+    if reason == "magaza_ipsiz":
         return jsonify(
             {
                 "ok": False,
-                "message": (
-                    f"Bu sube icin IP dogrulanamadi. Sizin IP: {client_ip}. "
-                    f"Mağaza sabit internet IP'sini yonetici panelinde tanimlamali "
-                    "(veya cep verisi kullaniyorsaniz mobil IP yazilmali)."
-                ),
-                "client_ip": client_ip,
-                "allowed_ip": allowed_hint,
+                "message": "Mağaza IP tanımı yapılmamış. Yönetici panelinden IP girilmeli.",
+            }
+        ), 403
+    if not ip_ok:
+        return jsonify(
+            {
+                "ok": False,
+                "message": f"Tanınmayan bağlantı. Görünen IP: {client_ip}. Mağazanın çıkış IP’si ile eşleşmiyorsunuz.",
             }
         ), 403
 
@@ -550,10 +595,9 @@ def api_punch():
         (personnel_id,),
     ).fetchone()
     if not person:
-        return jsonify({"ok": False, "message": "Personel bulunamadi."}), 404
-
+        return jsonify({"ok": False, "message": "Personel bulunamadı."}), 404
     if person["branch_id"] != branch_id:
-        return jsonify({"ok": False, "message": "Personel farkli subeye bagli."}), 400
+        return jsonify({"ok": False, "message": "Personel başka mağazaya bağlı."}), 400
 
     open_record = db.execute(
         """
@@ -567,9 +611,9 @@ def api_punch():
     expected = "out" if open_record else "in"
     if action != expected:
         mes = (
-            "Simdi yalnizca cikis yapabilirsiniz."
+            "Şimdi yalnızca çıkış yapılabilir."
             if expected == "out"
-            else "Simdi yalnizca giris yapabilirsiniz."
+            else "Şimdi yalnızca giriş yapılabilir."
         )
         return jsonify({"ok": False, "message": mes}), 400
 
@@ -587,7 +631,7 @@ def api_punch():
             ),
         )
         db.commit()
-        return jsonify({"ok": True, "message": f"{person['full_name']} icin giris kaydedildi."})
+        return jsonify({"ok": True, "message": f"{person['full_name']}: giriş kaydı alındı."})
 
     if action == "out":
         checkin_at = datetime.strptime(open_record["checkin_at"], "%Y-%m-%d %H:%M:%S")
@@ -601,107 +645,9 @@ def api_punch():
             (now_str(), duration, open_record["id"]),
         )
         db.commit()
-        return jsonify({"ok": True, "message": f"{person['full_name']} icin cikis kaydedildi."})
+        return jsonify({"ok": True, "message": f"{person['full_name']}: çıkış kaydı alındı."})
 
-    return jsonify({"ok": False, "message": "Islem tipi hatali."}), 400
-
-
-@app.get("/api/sube/<int:branch_id>/kod")
-def api_branch_code(branch_id):
-    db = get_db()
-    branch = db.execute("SELECT id FROM branches WHERE id = ?", (branch_id,)).fetchone()
-    if not branch:
-        return jsonify({"ok": False, "message": "Sube bulunamadi."}), 404
-    return jsonify(
-        {
-            "ok": True,
-            "code": generate_dynamic_code(branch_id),
-            "refresh_seconds": 20,
-            "server_time": now_str(),
-        }
-    )
-
-
-@app.post("/api/finance/sync")
-def api_finance_sync():
-    db = get_db()
-    payload = request.get_json(silent=True) or {}
-    entries = payload.get("entries", [])
-
-    for item in entries:
-        uid = str(item.get("uid", "")).strip()
-        if not uid:
-            continue
-        entry_type = item.get("entry_type")
-        if entry_type not in ("income", "expense"):
-            continue
-        try:
-            amount = float(item.get("amount", 0))
-        except (TypeError, ValueError):
-            continue
-        category = str(item.get("category", "Genel")).strip() or "Genel"
-        description = str(item.get("description", "")).strip()
-        entry_date = str(item.get("entry_date", datetime.now().strftime("%Y-%m-%d"))).strip()
-        db.execute(
-            """
-            INSERT OR IGNORE INTO finance_entries
-            (uid, entry_type, amount, category, description, entry_date, source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'localStorage', ?)
-            """,
-            (uid, entry_type, amount, category, description, entry_date, now_str()),
-        )
-
-    db.commit()
-    rows = db.execute(
-        "SELECT uid, entry_type, amount, category, description, entry_date FROM finance_entries"
-    ).fetchall()
-    return jsonify({"ok": True, "entries": [dict(row) for row in rows]})
-
-
-@app.get("/api/dashboard")
-def api_dashboard():
-    db = get_db()
-    rows = db.execute(
-        "SELECT entry_type, amount, category, entry_date FROM finance_entries ORDER BY entry_date ASC"
-    ).fetchall()
-
-    total_income = sum(r["amount"] for r in rows if r["entry_type"] == "income")
-    total_expense = sum(r["amount"] for r in rows if r["entry_type"] == "expense")
-
-    today = datetime.now().date()
-    weekly_points = []
-    for day_offset in range(6, -1, -1):
-        day = today - timedelta(days=day_offset)
-        day_str = day.strftime("%Y-%m-%d")
-        income = sum(
-            r["amount"]
-            for r in rows
-            if r["entry_type"] == "income" and r["entry_date"] == day_str
-        )
-        expense = sum(
-            r["amount"]
-            for r in rows
-            if r["entry_type"] == "expense" and r["entry_date"] == day_str
-        )
-        weekly_points.append({"date": day_str, "income": income, "expense": expense})
-
-    expense_by_category = {}
-    for r in rows:
-        if r["entry_type"] == "expense":
-            expense_by_category[r["category"]] = expense_by_category.get(r["category"], 0) + r["amount"]
-
-    return jsonify(
-        {
-            "ok": True,
-            "totals": {
-                "income": total_income,
-                "expense": total_expense,
-                "net": total_income - total_expense,
-            },
-            "weekly": weekly_points,
-            "expense_by_category": expense_by_category,
-        }
-    )
+    return jsonify({"ok": False, "message": "Geçersiz işlem."}), 400
 
 
 @app.get("/rapor/excel")
@@ -712,13 +658,9 @@ def export_excel():
     db = get_db()
     rows = db.execute(
         """
-        SELECT
-            p.full_name AS isim,
-            b.name AS sube,
-            a.date AS tarih,
-            COALESCE(a.checkin_at, '-') AS giris_saati,
-            COALESCE(a.checkout_at, '-') AS cikis_saati,
-            a.duration_minutes AS sure_dk
+        SELECT p.full_name AS isim, b.name AS sube, a.date AS tarih,
+            COALESCE(a.checkin_at, '-') AS giris, COALESCE(a.checkout_at, '-') AS cikis,
+            a.duration_minutes AS dk
         FROM attendance a
         JOIN personnel p ON p.id = a.personnel_id
         JOIN branches b ON b.id = a.branch_id
@@ -728,22 +670,21 @@ def export_excel():
 
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Isim", "Sube", "Tarih", "Giris Saati", "Cikis Saati", "Sure (dk)"])
+    writer.writerow(["İsim", "Mağaza", "Tarih", "Giriş", "Çıkış", "Süre (dk)"])
     for row in rows:
         writer.writerow(
             [
                 row["isim"],
                 row["sube"],
                 row["tarih"],
-                row["giris_saati"],
-                row["cikis_saati"],
-                row["sure_dk"],
+                row["giris"],
+                row["cikis"],
+                row["dk"],
             ]
         )
-
-    response = Response(output.getvalue(), mimetype="application/vnd.ms-excel")
-    response.headers["Content-Disposition"] = "attachment; filename=pdks_rapor.csv"
-    return response
+    resp = Response(output.getvalue(), mimetype="application/vnd.ms-excel")
+    resp.headers["Content-Disposition"] = "attachment; filename=pdks_mesai.csv"
+    return resp
 
 
 if __name__ == "__main__":

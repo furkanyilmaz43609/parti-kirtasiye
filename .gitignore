@@ -4,3 +4,6 @@ venv/
 .env
 *.db
 .DS_Store
+
+# Yerel hatalı oluşan dosyalar
+**/ssh-keygen*

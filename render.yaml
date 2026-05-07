@@ -11,5 +11,3 @@ services:
         value: "3.11.9"
       - key: SECRET_KEY
         generateValue: true
-      - key: CODE_SECRET
-        generateValue: true
