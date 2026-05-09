@@ -45,7 +45,7 @@
         <div class="d-flex gap-2 flex-wrap">
             <a class="btn btn-sm btn-outline-light" href="/personel" target="_blank">Personel ekranı</a>
             <a class="btn btn-sm btn-outline-light" href="/rapor/excel">Mesai CSV</a>
-            <a class="btn btn-sm btn-outline-secondary" href="#gun-sonu">Gün sonu</a>
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('gun_sonu_detail') }}">Gün sonu</a>
             <a class="btn btn-sm btn-light" href="/logout">Çıkış</a>
         </div>
     </div>
@@ -264,125 +264,6 @@
             </div>
             {% endif %}
 
-            <div class="card-s p-4 mb-4" id="gun-sonu">
-                <div class="section-title">Gün sonu (kasa)</div>
-                <p class="small text-secondary mt-2 mb-3">
-                    Kontrol: <strong>Nakit + Gider + Kart</strong> ile <strong>Kasadaki toplam − Ekrandaki toplam</strong> aynı olmalı.
-                    Fark = (Nakit + Gider + Kart) − (Kasa − Ekran). Fark sıfıra yakınsa <span class="gauge-denk fw-semibold">denk</span>, pozitifse <span class="gauge-fazla fw-semibold">fazla</span>, negatifse <span class="gauge-eksik fw-semibold">eksik</span>.
-                </p>
-
-                <form method="get" class="row g-2 align-items-end mb-4">
-                    {% if selected_pid %}<input type="hidden" name="pid" value="{{ selected_pid }}">{% endif %}
-                    {% if selected_start %}<input type="hidden" name="start_date" value="{{ selected_start }}">{% endif %}
-                    {% if selected_end %}<input type="hidden" name="end_date" value="{{ selected_end }}">{% endif %}
-                    <div class="col-sm-3">
-                        <label class="form-label small text-secondary mb-1">Başlangıç</label>
-                        <input type="date" class="form-control form-control-sm" name="gs_start" value="{{ gs_q_start or '' }}">
-                    </div>
-                    <div class="col-sm-3">
-                        <label class="form-label small text-secondary mb-1">Bitiş</label>
-                        <input type="date" class="form-control form-control-sm" name="gs_end" value="{{ gs_q_end or '' }}">
-                    </div>
-                    <div class="col-sm-4">
-                        <label class="form-label small text-secondary mb-1">Mağaza</label>
-                        <select class="form-select form-select-sm" name="gs_branch">
-                            <option value="">Tümü</option>
-                            {% for b in branches %}
-                                {% if b['active'] %}<option value="{{ b.id }}" {% if gs_branch_filter == b.id %}selected{% endif %}>{{ b.name }}</option>{% endif %}
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="col-sm-2 d-grid">
-                        <button type="submit" class="btn btn-sm btn-outline-light">Filtrele</button>
-                    </div>
-                    <div class="col-12"><span class="small text-secondary">Tarih boş bırakılırsa son 120 güne bakılır.</span></div>
-                </form>
-
-                <div class="row g-2 mb-4">
-                    <div class="col-md-3"><div class="stat-box"><div class="small text-secondary">Σ Nakit</div><div class="fw-semibold">{{ "%.2f"|format(gs_totals.cash_tl) }} ₺</div></div></div>
-                    <div class="col-md-3"><div class="stat-box"><div class="small text-secondary">Σ Kart</div><div class="fw-semibold">{{ "%.2f"|format(gs_totals.card_tl) }} ₺</div></div></div>
-                    <div class="col-md-3"><div class="stat-box"><div class="small text-secondary">Σ Gider</div><div class="fw-semibold">{{ "%.2f"|format(gs_totals.expense_tl) }} ₺</div></div></div>
-                    <div class="col-md-3"><div class="stat-box"><div class="small text-secondary">Σ Kasa / Σ Ekran</div><div class="fw-semibold">{{ "%.2f"|format(gs_totals.drawer_tl) }} / {{ "%.2f"|format(gs_totals.screen_tl) }} ₺</div></div></div>
-                    <div class="col-12">
-                        <div class="stat-box {% if gs_totals.rollup_status == 'denk' %}border border-success border-opacity-50{% elif gs_totals.rollup_status == 'eksik' %}border border-danger border-opacity-50{% else %}border border-warning border-opacity-50{% endif %}">
-                            <div class="small text-secondary">Filtredeki satırlar — toplulaştırılmış kontrol</div>
-                            <div class="mt-1">İşlem: <strong>{{ "%.2f"|format(gs_totals.rollup_transaction_sum_tl) }} ₺</strong> (= nakit + gider + kart)<br>
-                            Kasa − Ekran: <strong>{{ "%.2f"|format(gs_totals.rollup_kasa_minus_screen_tl) }} ₺</strong></div>
-                            <div class="fs-6 fw-semibold mt-2 {% if gs_totals.rollup_status == 'denk' %}gauge-denk{% elif gs_totals.rollup_status == 'eksik' %}gauge-eksik{% else %}gauge-fazla{% endif %}">
-                                {% if gs_totals.rollup_status == 'denk' %}Denk{% elif gs_totals.rollup_status == 'eksik' %}Toplamda {{ "%.2f"|format(gs_totals.rollup_diff_tl|abs) }} ₺ eksik (fark {{ "%.2f"|format(gs_totals.rollup_diff_tl) }}){% else %}Toplamda {{ "%.2f"|format(gs_totals.rollup_diff_tl) }} ₺ fazla{% endif %}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="section-title mb-2">Yeni kayıt / güncelle</div>
-                <form method="post" class="row g-2 mb-4">
-                    <input type="hidden" name="action" value="save_day_end">
-                    {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                    <input type="hidden" name="gs_start" value="{{ gs_q_start or '' }}">
-                    <input type="hidden" name="gs_end" value="{{ gs_q_end or '' }}">
-                    <input type="hidden" name="gs_branch" value="{{ gs_branch_filter or '' }}">
-                    <div class="col-md-4">
-                        <label class="form-label small text-secondary mb-1">Mağaza</label>
-                        <select class="form-select form-select-sm" name="branch_id" required>
-                            {% for b in branches %}
-                                {% if b['active'] %}<option value="{{ b.id }}">{{ b.name }}</option>{% endif %}
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label small text-secondary mb-1">Tarih</label>
-                        <input type="date" class="form-control form-control-sm" name="report_date" value="{{ default_gs_date }}" required>
-                    </div>
-                    <div class="col-md-4"><label class="form-label small text-secondary mb-1">Nakit</label><input class="form-control form-control-sm" name="cash_tl" placeholder="0" value="0"></div>
-                    <div class="col-md-4"><label class="form-label small text-secondary mb-1">Kart</label><input class="form-control form-control-sm" name="card_tl" placeholder="0" value="0"></div>
-                    <div class="col-md-4"><label class="form-label small text-secondary mb-1">Gider</label><input class="form-control form-control-sm" name="expense_tl" placeholder="0" value="0"></div>
-                    <div class="col-md-4"><label class="form-label small text-secondary mb-1">Kasadaki toplam</label><input class="form-control form-control-sm" name="drawer_tl" placeholder="0" value="0"></div>
-                    <div class="col-md-4"><label class="form-label small text-secondary mb-1">Ekrandaki gün sonu</label><input class="form-control form-control-sm" name="screen_tl" placeholder="0" value="0"></div>
-                    <div class="col-12"><label class="form-label small text-secondary mb-1">Not (isteğe bağlı)</label><input class="form-control form-control-sm" name="note" placeholder="Kısa açıklama"></div>
-                    <div class="col-12"><button type="submit" class="btn btn-sm text-white" style="background:var(--accent)">Kaydet veya güncelle</button></div>
-                </form>
-
-                <div class="table-responsive rounded-2">
-                    <table class="table table-sm compact table-darkish mb-0">
-                        <thead><tr>
-                            <th>Tarih</th><th>Mağaza</th><th>Nakit</th><th>Kart</th><th>Gider</th><th>Kasa</th><th>Ekran</th><th>İşlem Σ</th><th>Kasa−Ekran</th><th>Durum</th><th></th>
-                        </tr></thead>
-                        <tbody>
-                        {% for r in day_end_rows %}
-                            <tr>
-                                <td>{{ r.report_date|tr_iso_date }}</td>
-                                <td>{{ r.branch_name }}</td>
-                                <td>{{ "%.2f"|format(r.cash_tl) }}</td>
-                                <td>{{ "%.2f"|format(r.card_tl) }}</td>
-                                <td>{{ "%.2f"|format(r.expense_tl) }}</td>
-                                <td>{{ "%.2f"|format(r.drawer_tl) }}</td>
-                                <td>{{ "%.2f"|format(r.screen_tl) }}</td>
-                                <td>{{ "%.2f"|format(r.transaction_sum_tl) }}</td>
-                                <td>{{ "%.2f"|format(r.kasa_minus_screen_tl) }}</td>
-                                <td class="{% if r.reconcile_status == 'denk' %}gauge-denk{% elif r.reconcile_status == 'eksik' %}gauge-eksik{% else %}gauge-fazla{% endif %}">
-                                    {% if r.reconcile_status == 'denk' %}Denk{% elif r.reconcile_status == 'eksik' %}Eksik {{ "%.2f"|format(r.diff_tl|abs) }} ₺{% else %}Fazla {{ "%.2f"|format(r.diff_tl) }} ₺{% endif %}
-                                </td>
-                                <td>
-                                    <form method="post" class="mb-0" onsubmit="return confirm('Bu gün sonu kaydını silmek istediğinize emin misiniz?');">
-                                        <input type="hidden" name="action" value="delete_day_end">
-                                        <input type="hidden" name="report_id" value="{{ r.id }}">
-                                        {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                                        <input type="hidden" name="gs_start" value="{{ gs_q_start or '' }}">
-                                        <input type="hidden" name="gs_end" value="{{ gs_q_end or '' }}">
-                                        <input type="hidden" name="gs_branch" value="{{ gs_branch_filter or '' }}">
-                                        <button type="submit" class="btn btn-sm btn-link text-danger p-0 small">Sil</button>
-                                    </form>
-                                </td>
-                            </tr>
-                        {% else %}
-                            <tr><td colspan="11" class="text-secondary">Henüz gün sonu kaydı yok veya filtreye uyan satır yok.</td></tr>
-                        {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
             <div class="card-s p-4">
                 <span class="section-title">Canlı mesai</span>
                 <div class="table-responsive mt-3 rounded-2 overflow-hidden" style="max-height:min(70vh,640px)">
@@ -402,6 +283,32 @@
                             </tr>
                         {% else %}
                             <tr><td colspan="6" class="text-secondary">Kayıt yok</td></tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card-s p-3 mt-3 mb-4" id="gun-sonu-ozet">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+                    <span class="section-title mb-0">Gün sonu (özet)</span>
+                    <a class="btn btn-sm btn-outline-light" href="{{ url_for('gun_sonu_detail') }}">Gün sonu detayları →</a>
+                </div>
+                <p class="small text-secondary mb-2 mb-md-3">Tam giriş, hesaplama düğmeleri ve tarih filtresi ayrı ekranda. Burada son 5 kayıt.</p>
+                <div class="table-responsive rounded-2">
+                    <table class="table table-sm compact table-darkish mb-0">
+                        <thead><tr><th>Tarih</th><th>Mağaza</th><th>Kasa</th><th>Ekran</th><th>Durum</th></tr></thead>
+                        <tbody>
+                        {% for r in gun_son_recent %}
+                            <tr>
+                                <td>{{ r.report_date|tr_iso_date }}</td>
+                                <td>{{ r.branch_name }}</td>
+                                <td>{{ "%.2f"|format(r.drawer_tl) }}</td>
+                                <td>{{ "%.2f"|format(r.screen_tl) }}</td>
+                                <td class="{% if r.reconcile_status == 'denk' %}gauge-denk{% elif r.reconcile_status == 'eksik' %}gauge-eksik{% else %}gauge-fazla{% endif %}">{{ r.reconcile_status }}</td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="5" class="text-secondary">Henüz gün sonu yok.</td></tr>
                         {% endfor %}
                         </tbody>
                     </table>
