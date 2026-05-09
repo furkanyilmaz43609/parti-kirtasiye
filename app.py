@@ -1,12 +1,15 @@
 import csv
 import hashlib
 import hmac
+import math
 import os
 import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from io import StringIO
 from zoneinfo import ZoneInfo
+
+from urllib.parse import urlencode
 
 from flask import (
     Flask,
@@ -119,6 +122,26 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS day_end_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            branch_id INTEGER NOT NULL,
+            report_date TEXT NOT NULL,
+            cash_tl REAL NOT NULL DEFAULT 0,
+            card_tl REAL NOT NULL DEFAULT 0,
+            expense_tl REAL NOT NULL DEFAULT 0,
+            drawer_tl REAL NOT NULL DEFAULT 0,
+            screen_tl REAL NOT NULL DEFAULT 0,
+            transaction_sum_tl REAL NOT NULL DEFAULT 0,
+            kasa_minus_screen_tl REAL NOT NULL DEFAULT 0,
+            diff_tl REAL NOT NULL DEFAULT 0,
+            reconcile_status TEXT NOT NULL DEFAULT 'denk',
+            note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE,
+            UNIQUE(branch_id, report_date)
+        );
         """
     )
     db.commit()
@@ -204,6 +227,30 @@ def format_iso_date_tr(iso_day: str | None) -> str:
     return f"{iso_day[8:10]}.{iso_day[5:7]}.{iso_day[:4]}"
 
 
+def parse_money(value: str | None) -> float:
+    s = (value or "").strip().replace(",", ".")
+    if not s:
+        return 0.0
+    try:
+        return round(float(s), 2)
+    except ValueError:
+        return float("nan")
+
+
+def day_end_derived(cash_tl, card_tl, expense_tl, drawer_tl, screen_tl) -> tuple:
+    transaction_sum_tl = cash_tl + expense_tl + card_tl
+    kasa_minus_screen_tl = drawer_tl - screen_tl
+    diff_tl = transaction_sum_tl - kasa_minus_screen_tl
+    eps = 0.009
+    if abs(diff_tl) <= eps:
+        status = "denk"
+    elif diff_tl > 0:
+        status = "fazla"
+    else:
+        status = "eksik"
+    return transaction_sum_tl, kasa_minus_screen_tl, round(diff_tl, 2), status
+
+
 def parse_iso_date(value: str | None):
     s = (value or "").strip()
     if not s:
@@ -262,6 +309,40 @@ def choice_lock_error_response(db, personnel_id: int, branch_id: int):
             }
         ), 400
     return None
+
+
+def _admin_redirect_suffix(form) -> str:
+    pairs = []
+    rp = form.get("return_pid", type=int)
+    if rp:
+        pairs.append(("pid", str(rp)))
+    sd = (form.get("preserve_start_date") or form.get("start_date") or "").strip()
+    ed = (form.get("preserve_end_date") or form.get("end_date") or "").strip()
+    if sd:
+        pairs.append(("start_date", sd))
+    if ed:
+        pairs.append(("end_date", ed))
+    gs_a = (form.get("gs_start") or "").strip()
+    gs_b = (form.get("gs_end") or "").strip()
+    gb = (form.get("gs_branch") or "").strip()
+    if gs_a:
+        pairs.append(("gs_start", gs_a))
+    if gs_b:
+        pairs.append(("gs_end", gs_b))
+    if gb:
+        pairs.append(("gs_branch", gb))
+    return "?" + urlencode(pairs) if pairs else ""
+
+
+def parse_hhmm(raw: str | None):
+    s = (raw or "").strip()
+    if len(s) < 4:
+        return None
+    try:
+        datetime.strptime(s, "%H:%M")
+    except ValueError:
+        return None
+    return s
 
 
 def get_client_ip():
@@ -646,6 +727,107 @@ def admin():
                 set_setting("admin_password_hash", hash_password(new_password))
                 flash("Yönetici şifresi güncellendi.", "success")
 
+        elif action == "set_branch_hours":
+            bid = int(request.form["branch_id"])
+            ss = parse_hhmm(request.form.get("shift_start"))
+            se = parse_hhmm(request.form.get("shift_end"))
+            if not ss or not se:
+                flash("Giriş/çıkış saati HH:MM formatında olmalı (ör. 09:00).", "danger")
+            else:
+                db.execute(
+                    "UPDATE branches SET shift_start = ?, shift_end = ? WHERE id = ?",
+                    (ss, se, bid),
+                )
+                db.commit()
+                flash("Mağaza mesai saatleri güncellendi.", "success")
+
+        elif action == "save_day_end":
+            bid = int(request.form["branch_id"])
+            report_date = parse_iso_date(request.form.get("report_date"))
+            cash_tl = parse_money(request.form.get("cash_tl"))
+            card_tl = parse_money(request.form.get("card_tl"))
+            expense_tl = parse_money(request.form.get("expense_tl"))
+            drawer_tl = parse_money(request.form.get("drawer_tl"))
+            screen_tl = parse_money(request.form.get("screen_tl"))
+            note = (request.form.get("note") or "").strip() or None
+            bad_money = any(
+                math.isnan(x) for x in (cash_tl, card_tl, expense_tl, drawer_tl, screen_tl)
+            )
+            if report_date is None:
+                flash("Gün sonu tarihi geçersiz.", "danger")
+            elif bad_money:
+                flash("Tutar alanlarında geçersiz sayı var.", "danger")
+            else:
+                transaction_sum_tl, kasa_minus_screen_tl, diff_tl, reconcile_status = day_end_derived(
+                    cash_tl, card_tl, expense_tl, drawer_tl, screen_tl
+                )
+                iso = report_date.strftime("%Y-%m-%d")
+                row_exists = db.execute(
+                    "SELECT id FROM day_end_reports WHERE branch_id = ? AND report_date = ?",
+                    (bid, iso),
+                ).fetchone()
+                ts = now_str()
+                if row_exists:
+                    db.execute(
+                        """
+                        UPDATE day_end_reports SET cash_tl = ?, card_tl = ?, expense_tl = ?,
+                        drawer_tl = ?, screen_tl = ?, transaction_sum_tl = ?, kasa_minus_screen_tl = ?,
+                        diff_tl = ?, reconcile_status = ?, note = ?, updated_at = ?
+                        WHERE branch_id = ? AND report_date = ?
+                        """,
+                        (
+                            cash_tl,
+                            card_tl,
+                            expense_tl,
+                            drawer_tl,
+                            screen_tl,
+                            transaction_sum_tl,
+                            kasa_minus_screen_tl,
+                            diff_tl,
+                            reconcile_status,
+                            note,
+                            ts,
+                            bid,
+                            iso,
+                        ),
+                    )
+                else:
+                    db.execute(
+                        """
+                        INSERT INTO day_end_reports (
+                            branch_id, report_date, cash_tl, card_tl, expense_tl, drawer_tl, screen_tl,
+                            transaction_sum_tl, kasa_minus_screen_tl, diff_tl, reconcile_status,
+                            note, created_at, updated_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            bid,
+                            iso,
+                            cash_tl,
+                            card_tl,
+                            expense_tl,
+                            drawer_tl,
+                            screen_tl,
+                            transaction_sum_tl,
+                            kasa_minus_screen_tl,
+                            diff_tl,
+                            reconcile_status,
+                            note,
+                            ts,
+                            ts,
+                        ),
+                    )
+                db.commit()
+                flash("Gün sonu kaydı kaydedildi.", "success")
+            return redirect(url_for("admin") + _admin_redirect_suffix(request.form))
+
+        elif action == "delete_day_end":
+            rep_id = int(request.form["report_id"])
+            db.execute("DELETE FROM day_end_reports WHERE id = ?", (rep_id,))
+            db.commit()
+            flash("Gün sonu satırı silindi.", "success")
+            return redirect(url_for("admin") + _admin_redirect_suffix(request.form))
+
         return_pid = request.form.get("return_pid", type=int)
         if return_pid:
             return redirect(url_for("admin", pid=return_pid))
@@ -693,6 +875,83 @@ def admin():
                 else:
                     sel_range_stats = personnel_work_stats_range(db, selected_pid, start_date, end_date)
 
+    gs_branch_filter = request.args.get("gs_branch", type=int)
+    gs_q_start = (request.args.get("gs_start") or "").strip()
+    gs_q_end = (request.args.get("gs_end") or "").strip()
+    gd_start = parse_iso_date(gs_q_start) if gs_q_start else None
+    gd_end = parse_iso_date(gs_q_end) if gs_q_end else None
+    if gd_start and gd_end and gd_start > gd_end:
+        flash("Gün sonu raporu için başlangıç tarihi bitişten sonra; sıraları otomatik düzelttik.", "info")
+        gd_start, gd_end = gd_end, gd_start
+
+    de_clauses = []
+    de_params: list = []
+    if gd_start is not None and gd_end is not None:
+        de_clauses.append("d.report_date >= ? AND d.report_date <= ?")
+        de_params.extend([gd_start.strftime("%Y-%m-%d"), gd_end.strftime("%Y-%m-%d")])
+    elif gd_start is not None:
+        de_clauses.append("d.report_date >= ?")
+        de_params.append(gd_start.strftime("%Y-%m-%d"))
+    elif gd_end is not None:
+        de_clauses.append("d.report_date <= ?")
+        de_params.append(gd_end.strftime("%Y-%m-%d"))
+    else:
+        ago = now_tr().date() - timedelta(days=120)
+        de_clauses.append("d.report_date >= ?")
+        de_params.append(ago.strftime("%Y-%m-%d"))
+
+    if gs_branch_filter:
+        de_clauses.append("d.branch_id = ?")
+        de_params.append(gs_branch_filter)
+
+    de_where = " AND ".join(de_clauses)
+    day_end_sql = (
+        f"""
+        SELECT d.*, b.name AS branch_name
+        FROM day_end_reports d
+        JOIN branches b ON b.id = d.branch_id
+        WHERE {de_where}
+        ORDER BY d.report_date DESC, d.id DESC
+        LIMIT 500
+        """
+    )
+    day_end_rows = db.execute(day_end_sql, de_params).fetchall()
+
+    gs_totals = {
+        "cash_tl": 0.0,
+        "card_tl": 0.0,
+        "expense_tl": 0.0,
+        "drawer_tl": 0.0,
+        "screen_tl": 0.0,
+        "transaction_sum_tl": 0.0,
+        "kasa_minus_screen_tl": 0.0,
+        "diff_tl": 0.0,
+    }
+    for r in day_end_rows:
+        gs_totals["cash_tl"] += float(r["cash_tl"] or 0)
+        gs_totals["card_tl"] += float(r["card_tl"] or 0)
+        gs_totals["expense_tl"] += float(r["expense_tl"] or 0)
+        gs_totals["drawer_tl"] += float(r["drawer_tl"] or 0)
+        gs_totals["screen_tl"] += float(r["screen_tl"] or 0)
+        gs_totals["transaction_sum_tl"] += float(r["transaction_sum_tl"] or 0)
+        gs_totals["kasa_minus_screen_tl"] += float(r["kasa_minus_screen_tl"] or 0)
+        gs_totals["diff_tl"] += float(r["diff_tl"] or 0)
+    for k in gs_totals:
+        gs_totals[k] = round(gs_totals[k], 2)
+    agg_ts, agg_km, agg_diff, agg_status = day_end_derived(
+        gs_totals["cash_tl"],
+        gs_totals["card_tl"],
+        gs_totals["expense_tl"],
+        gs_totals["drawer_tl"],
+        gs_totals["screen_tl"],
+    )
+    gs_totals["rollup_transaction_sum_tl"] = round(agg_ts, 2)
+    gs_totals["rollup_kasa_minus_screen_tl"] = round(agg_km, 2)
+    gs_totals["rollup_diff_tl"] = round(agg_diff, 2)
+    gs_totals["rollup_status"] = agg_status
+
+    default_gs_date = now_tr().date().strftime("%Y-%m-%d")
+
     return render_template(
         "admin.html",
         branches=branches,
@@ -705,6 +964,12 @@ def admin():
         sel_range_stats=sel_range_stats,
         selected_start=selected_start,
         selected_end=selected_end,
+        day_end_rows=day_end_rows,
+        gs_totals=gs_totals,
+        gs_branch_filter=gs_branch_filter,
+        gs_q_start=gs_q_start,
+        gs_q_end=gs_q_end,
+        default_gs_date=default_gs_date,
     )
 
 
