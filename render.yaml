@@ -1,8 +1,13 @@
+# Render'da ÜCRETSİZ (free) web servisinde dosya sistemi geçicidir: SQLite veritabanı her yeni
+# deploy / yeniden başlatmada SİLİNİR. Veriyi korumak için:
+#   1) Bu servisi en az STARTER (ücretli) plana alın
+#   2) Dashboard → Disks → Persistent Disk ekleyin, mount: /var/data
+#   3) Ortam değişkeni DATABASE_PATH=/var/data/pdks_merkez.db (aşağıda tanımlı) kalsın
 services:
   - type: web
     name: parti-kirtasiye-pdks
     runtime: python
-    plan: free
+    plan: starter
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --bind 0.0.0.0:$PORT app:app

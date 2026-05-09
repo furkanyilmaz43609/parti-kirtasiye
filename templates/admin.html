@@ -53,6 +53,14 @@
 
 <div class="wrap container-fluid px-3 py-4">
 
+    {% if show_render_sqlite_warning %}
+    <div class="alert alert-warning py-2 small mb-3 border border-warning border-opacity-50">
+        <strong>Render uyarısı:</strong> Ücretsiz planda disk <em>kalıcı değildir</em>; uygulama güncellenince veya servis yeniden başlayınca paneldeki SQLite verileri kaybolabilir.
+        Kalıcılık için servisi <strong>Starter</strong> (ücretli) plana alın, <strong>Persistent Disk</strong> ekleyip <code class="text-dark">/var/data</code> olarak bağlayın ve <code class="text-dark">DATABASE_PATH=/var/data/pdks_merkez.db</code> ortam değişkenini kullanın.
+        (Bu uyarıyı gizlemek için ortamda <code class="text-dark">RENDER_SQLITE_SILENT=1</code> verebilirsiniz.)
+    </div>
+    {% endif %}
+
     {% with msgs = get_flashed_messages(with_categories=true) %}
         {% if msgs %}
             {% for cat, msg in msgs %}

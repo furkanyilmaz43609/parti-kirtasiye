@@ -30,7 +30,7 @@ TR = ZoneInfo("Europe/Istanbul")
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "pdks-local-dev-change-me")
 
-DATABASE = os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "pdks_merkez.db"))
+DATABASE = os.path.abspath(os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "pdks_merkez.db")))
 
 _RENDER_HOSTED = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
 if _RENDER_HOSTED:
@@ -51,10 +51,22 @@ def redirect_after_admin_login(request_next: str):
 
 def get_db():
     if "db" not in g:
+        db_dir = os.path.dirname(DATABASE)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         g.db = sqlite3.connect(DATABASE)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
+
+
+@app.context_processor
+def inject_sqlite_hosting_notice():
+    if os.environ.get("RENDER_SQLITE_SILENT") == "1":
+        return {}
+    if not _RENDER_HOSTED:
+        return {}
+    return {"show_render_sqlite_warning": True}
 
 
 @app.teardown_appcontext

@@ -43,6 +43,13 @@
 </nav>
 
 <div class="wrap container-fluid px-3 py-4">
+
+    {% if show_render_sqlite_warning %}
+    <div class="alert alert-warning py-2 small mb-3 border border-warning border-opacity-50">
+        <strong>Render:</strong> Ücretsiz planda veritabanı güncellemelerde sıfırlanabilir. Kalıcı kayıt için <strong>Starter + Persistent Disk</strong> (<code>/var/data</code>) kullanın — ayrıntı ana yöneticideki uyarıda.
+    </div>
+    {% endif %}
+
     {% with msgs = get_flashed_messages(with_categories=true) %}
         {% if msgs %}
             {% for cat, msg in msgs %}
