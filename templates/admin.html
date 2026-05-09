@@ -119,6 +119,17 @@
             </div>
 
             <div class="card-s p-3 mb-4">
+                <div class="section-title mb-2">Yönetici şifresi</div>
+                <form method="post" class="row g-2">
+                    <input type="hidden" name="action" value="change_admin_password">
+                    {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                    <div class="col-12"><input type="password" class="form-control form-control-sm" name="current_password" placeholder="Mevcut şifre" required></div>
+                    <div class="col-12"><input type="password" class="form-control form-control-sm" name="new_password" placeholder="Yeni şifre (min. 4)" required></div>
+                    <div class="col-12"><button type="submit" class="btn btn-sm btn-outline-warning w-100">Şifreyi güncelle</button></div>
+                </form>
+            </div>
+
+            <div class="card-s p-3 mb-4">
                 <div class="section-title mb-2">Mağazalar</div>
                 <div class="table-responsive">
                     <table class="table table-sm compact table-darkish mb-0">
@@ -162,6 +173,12 @@
                             {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
                             <button type="submit" class="btn btn-sm btn-outline-danger">Sil</button>
                         </form>
+                        <form method="post" class="mb-0" onsubmit="return confirm('Bu personelin cihaz eşleştirmesi sıfırlansın mı?');">
+                            <input type="hidden" name="action" value="reset_device_binding">
+                            <input type="hidden" name="personnel_id" value="{{ p.id }}">
+                            {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                            <button type="submit" class="btn btn-sm btn-outline-secondary">Cihaz sıfırla</button>
+                        </form>
                     </div>
                 {% else %}
                     <span class="text-secondary small">Henüz personel yok.</span>
@@ -179,6 +196,23 @@
                     </div>
                     <a href="{{ url_for('admin') }}" class="small text-secondary">Temizle</a>
                 </div>
+                <form method="get" class="row g-2 mt-2 align-items-end">
+                    <input type="hidden" name="pid" value="{{ selected_pid }}">
+                    <div class="col-sm-5">
+                        <label class="form-label small text-secondary mb-1">Başlangıç</label>
+                        <input type="date" class="form-control form-control-sm" name="start_date" value="{{ selected_start or '' }}">
+                    </div>
+                    <div class="col-sm-5">
+                        <label class="form-label small text-secondary mb-1">Bitiş</label>
+                        <input type="date" class="form-control form-control-sm" name="end_date" value="{{ selected_end or '' }}">
+                    </div>
+                    <div class="col-sm-2 d-grid">
+                        <button type="submit" class="btn btn-sm btn-outline-light">Uygula</button>
+                    </div>
+                    <div class="col-12">
+                        <a href="{{ url_for('admin', pid=selected_pid) }}" class="small text-secondary">Aralığı temizle</a>
+                    </div>
+                </form>
                 <div class="row g-3 mt-2">
                     <div class="col-md-4">
                         <div class="stat-box">
@@ -201,6 +235,13 @@
                         </div>
                     </div>
                 </div>
+                {% if sel_range_stats %}
+                <div class="stat-box mt-3">
+                    <div class="text-secondary small">Seçilen aralık ({{ sel_range_stats.start_label }} - {{ sel_range_stats.end_label }})</div>
+                    <div class="fs-6 fw-semibold mt-1">{{ sel_range_stats.range_days }} gün</div>
+                    <div class="mt-1">{{ sel_range_stats.range_hm }}</div>
+                </div>
+                {% endif %}
                 <p class="small text-secondary mt-3 mb-0">Süreler Türkiye saatiyle hesaplanır (tamamlanan kayıtlar + bugün açıksa güncel vardiya).</p>
             </div>
             {% else %}

@@ -2,6 +2,7 @@ import csv
 import hashlib
 import hmac
 import os
+import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from io import StringIO
@@ -104,6 +105,16 @@ def init_db():
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS device_bindings (
+            token_hash TEXT PRIMARY KEY,
+            personnel_id INTEGER NOT NULL,
+            branch_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            FOREIGN KEY (personnel_id) REFERENCES personnel(id) ON DELETE CASCADE,
+            FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -191,6 +202,16 @@ def format_iso_date_tr(iso_day: str | None) -> str:
     if not iso_day or len(iso_day) < 10 or iso_day[4] != "-":
         return str(iso_day or "")
     return f"{iso_day[8:10]}.{iso_day[5:7]}.{iso_day[:4]}"
+
+
+def parse_iso_date(value: str | None):
+    s = (value or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 @app.template_filter("tr_iso_date")
@@ -295,6 +316,50 @@ def verify_password(password: str):
     return hmac.compare_digest(stored_hash, entered_hash)
 
 
+def hash_device_token(token: str) -> str:
+    payload = f"{app.config['SECRET_KEY']}::device::{token}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def get_device_binding(db):
+    token = (request.cookies.get("pdks_device_token") or "").strip()
+    if not token:
+        return None
+    token_hash = hash_device_token(token)
+    row = db.execute(
+        """
+        SELECT d.personnel_id, d.branch_id, p.full_name, b.name AS branch_name
+        FROM device_bindings d
+        JOIN personnel p ON p.id = d.personnel_id
+        JOIN branches b ON b.id = d.branch_id
+        WHERE d.token_hash = ? AND p.active = 1 AND b.active = 1
+        """,
+        (token_hash,),
+    ).fetchone()
+    if not row:
+        return None
+    db.execute(
+        "UPDATE device_bindings SET last_seen_at = ? WHERE token_hash = ?",
+        (now_str(), token_hash),
+    )
+    db.commit()
+    return row
+
+
+def bind_device_for_personnel(db, personnel_id: int, branch_id: int):
+    token = secrets.token_urlsafe(32)
+    token_hash = hash_device_token(token)
+    db.execute(
+        """
+        INSERT INTO device_bindings (token_hash, personnel_id, branch_id, created_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (token_hash, personnel_id, branch_id, now_str(), now_str()),
+    )
+    db.commit()
+    return token
+
+
 def fetch_branches(active_only=False):
     db = get_db()
     q = "SELECT * FROM branches"
@@ -394,6 +459,43 @@ def personnel_work_stats(db, personnel_id: int):
         "month_days": len(monthly_days),
         "month_hours": fmt_h(monthly_minutes),
         "month_hm": format_duration_tr(monthly_minutes),
+    }
+
+
+def personnel_work_stats_range(db, personnel_id: int, start_date, end_date):
+    rows = db.execute(
+        """
+        SELECT date, checkin_at, checkout_at, duration_minutes
+        FROM attendance
+        WHERE personnel_id = ? AND date >= ? AND date <= ?
+        ORDER BY id
+        """,
+        (personnel_id, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
+    ).fetchall()
+
+    now = now_tr()
+    today_s = now.strftime("%Y-%m-%d")
+    total_minutes = 0
+    worked_days = set()
+
+    for row in rows:
+        minutes = 0
+        if row["checkout_at"]:
+            minutes = int(row["duration_minutes"] or 0)
+        elif row["checkin_at"] and row["date"] == today_s:
+            ci = _parse_ts_tr(row["checkin_at"])
+            if ci:
+                minutes = _minutes_between(ci, now)
+        if minutes > 0:
+            total_minutes += minutes
+            worked_days.add(row["date"])
+
+    return {
+        "range_days": len(worked_days),
+        "range_hours": round(total_minutes / 60.0, 2),
+        "range_hm": format_duration_tr(total_minutes),
+        "start_label": format_iso_date_tr(start_date.strftime("%Y-%m-%d")),
+        "end_label": format_iso_date_tr(end_date.strftime("%Y-%m-%d")),
     }
 
 
@@ -511,6 +613,12 @@ def admin():
             if return_pid == pid:
                 return redirect(url_for("admin"))
 
+        elif action == "reset_device_binding":
+            pid = int(request.form["personnel_id"])
+            db.execute("DELETE FROM device_bindings WHERE personnel_id = ?", (pid,))
+            db.commit()
+            flash("Cihaz eşleştirmesi sıfırlandı. Personel ilk girişte yeniden seçim yapacak.", "success")
+
         elif action == "add_note":
             content = request.form.get("content", "").strip()
             if content:
@@ -526,6 +634,17 @@ def admin():
             db.execute("DELETE FROM announcements WHERE id = ?", (note_id,))
             db.commit()
             flash("Duyuru silindi.", "success")
+
+        elif action == "change_admin_password":
+            current_password = request.form.get("current_password", "").strip()
+            new_password = request.form.get("new_password", "").strip()
+            if not verify_password(current_password):
+                flash("Mevcut şifre hatalı.", "danger")
+            elif len(new_password) < 4:
+                flash("Yeni şifre en az 4 karakter olmalı.", "danger")
+            else:
+                set_setting("admin_password_hash", hash_password(new_password))
+                flash("Yönetici şifresi güncellendi.", "success")
 
         return_pid = request.form.get("return_pid", type=int)
         if return_pid:
@@ -551,7 +670,10 @@ def admin():
     ).fetchall()
 
     selected_pid = request.args.get("pid", type=int)
+    selected_start = (request.args.get("start_date") or "").strip()
+    selected_end = (request.args.get("end_date") or "").strip()
     sel_stats = None
+    sel_range_stats = None
     sel_name = None
     if selected_pid:
         prow = db.execute(
@@ -561,6 +683,15 @@ def admin():
         if prow:
             sel_name = prow["full_name"]
             sel_stats = personnel_work_stats(db, selected_pid)
+            start_date = parse_iso_date(selected_start)
+            end_date = parse_iso_date(selected_end)
+            if selected_start and selected_end:
+                if not start_date or not end_date:
+                    flash("Tarih aralığı geçersiz.", "warning")
+                elif start_date > end_date:
+                    flash("Başlangıç tarihi, bitişten büyük olamaz.", "warning")
+                else:
+                    sel_range_stats = personnel_work_stats_range(db, selected_pid, start_date, end_date)
 
     return render_template(
         "admin.html",
@@ -571,6 +702,9 @@ def admin():
         selected_pid=selected_pid,
         sel_name=sel_name,
         sel_stats=sel_stats,
+        sel_range_stats=sel_range_stats,
+        selected_start=selected_start,
+        selected_end=selected_end,
     )
 
 
@@ -578,6 +712,28 @@ def admin():
 def personel():
     db = get_db()
     reconcile_personel_lock(db)
+    device_binding = get_device_binding(db)
+    if device_binding and not session.get("pdks_choice_lock"):
+        session["pdks_choice_lock"] = {
+            "personnel_id": int(device_binding["personnel_id"]),
+            "branch_id": int(device_binding["branch_id"]),
+            "full_name": device_binding["full_name"],
+            "branch_name": device_binding["branch_name"],
+        }
+        session.modified = True
+    elif device_binding:
+        lock = session.get("pdks_choice_lock")
+        if lock and (
+            int(lock.get("personnel_id", 0)) != int(device_binding["personnel_id"])
+            or int(lock.get("branch_id", 0)) != int(device_binding["branch_id"])
+        ):
+            session["pdks_choice_lock"] = {
+                "personnel_id": int(device_binding["personnel_id"]),
+                "branch_id": int(device_binding["branch_id"]),
+                "full_name": device_binding["full_name"],
+                "branch_name": device_binding["branch_name"],
+            }
+            session.modified = True
     branches = fetch_branches(active_only=True)
     personnel_rows = fetch_personnel_for_public()
     latest_note = db.execute(
@@ -590,6 +746,7 @@ def personel():
         personnel=personnel_rows,
         latest_note=latest_note,
         choice_lock=choice_lock,
+        device_binding=device_binding,
     )
 
 
@@ -621,6 +778,20 @@ def api_personnel_status():
         return jsonify({"ok": False, "message": "Mağaza ve personeli seçin."}), 400
 
     db = get_db()
+    device_binding = get_device_binding(db)
+    if device_binding and (
+        int(device_binding["personnel_id"]) != personnel_id
+        or int(device_binding["branch_id"]) != branch_id
+    ):
+        return jsonify(
+            {
+                "ok": False,
+                "message": (
+                    f"Bu cihaz yalnızca {device_binding['full_name']} / "
+                    f"{device_binding['branch_name']} için kullanılabilir."
+                ),
+            }
+        ), 403
     reconcile_personel_lock(db)
     chk = choice_lock_error_response(db, personnel_id, branch_id)
     if chk is not None:
@@ -681,10 +852,25 @@ def api_personnel_status():
 @app.post("/api/punch")
 def api_punch():
     db = get_db()
+    device_binding = get_device_binding(db)
     reconcile_personel_lock(db)
     personnel_id = int(request.form["personnel_id"])
     branch_id = int(request.form["branch_id"])
     action = request.form["action"]
+
+    if device_binding and (
+        int(device_binding["personnel_id"]) != personnel_id
+        or int(device_binding["branch_id"]) != branch_id
+    ):
+        return jsonify(
+            {
+                "ok": False,
+                "message": (
+                    f"Bu cihaz yalnızca {device_binding['full_name']} / "
+                    f"{device_binding['branch_name']} için kullanılabilir."
+                ),
+            }
+        ), 403
 
     chk = choice_lock_error_response(db, personnel_id, branch_id)
     if chk is not None:
@@ -754,6 +940,17 @@ def api_punch():
             ),
         )
         db.commit()
+        resp = jsonify({"ok": True, "message": f"{person['full_name']}: giriş kaydı alındı."})
+        if not device_binding:
+            token = bind_device_for_personnel(db, personnel_id, branch_id)
+            resp.set_cookie(
+                "pdks_device_token",
+                token,
+                max_age=60 * 60 * 24 * 365 * 2,
+                secure=_RENDER_HOSTED,
+                httponly=True,
+                samesite="Lax",
+            )
         session["pdks_choice_lock"] = {
             "personnel_id": personnel_id,
             "branch_id": branch_id,
@@ -761,7 +958,7 @@ def api_punch():
             "branch_name": branch["name"],
         }
         session.modified = True
-        return jsonify({"ok": True, "message": f"{person['full_name']}: giriş kaydı alındı."})
+        return resp
 
     if action == "out":
         ci = _parse_ts_tr(open_record["checkin_at"])

@@ -69,7 +69,14 @@
             <h1 class="h5 fw-semibold mb-1" style="color:var(--text)">Giriş / Çıkış</h1>
             <p class="small mb-3" style="color:var(--muted)">Mağaza ağı (tanımlı çıkış IP) gerekir. Saat: Türkiye (UTC+3).</p>
 
-            {% if choice_lock is not none and choice_lock.personnel_id is defined %}
+            {% if device_binding %}
+            <div class="lock-banner small p-2 mb-3 text-warning">
+                Bu cihaz <strong>{{ device_binding.full_name }}</strong> / {{ device_binding.branch_name }} için eşleştirildi.
+                Başka personel veya mağaza seçilemez.
+            </div>
+            {% endif %}
+
+            {% if not device_binding and choice_lock is not none and choice_lock.personnel_id is defined %}
             <div class="lock-banner small p-2 mb-3 text-warning">
                 Şu an bu cihaz <strong>{{ choice_lock.full_name }}</strong> için kilitli — çıkış yapana kadar başka mağaza/personel seçemezsiniz.
             </div>
