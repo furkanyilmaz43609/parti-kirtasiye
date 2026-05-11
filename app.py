@@ -8,6 +8,14 @@ from datetime import datetime, timedelta
 from io import StringIO
 from zoneinfo import ZoneInfo
 
+try:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2 import IntegrityError as PgIntegrityError
+except Exception:  # pragma: no cover
+    psycopg2 = None
+    PgIntegrityError = Exception
+
 from flask import (
     Flask,
     Response,
@@ -27,6 +35,7 @@ TR = ZoneInfo("Europe/Istanbul")
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "pdks-local-dev-change-me")
 
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 DATABASE = os.path.abspath(os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "pdks_merkez.db")))
 
 _RENDER_HOSTED = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
@@ -46,14 +55,53 @@ def redirect_after_admin_login(request_next: str):
     return redirect(url_for("admin"))
 
 
+class DB:
+    def __init__(self, backend: str, conn):
+        self.backend = backend
+        self.conn = conn
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def commit(self):
+        self.conn.commit()
+
+    def execute(self, query: str, params=()):
+        if self.backend == "sqlite":
+            return self.conn.execute(query, params)
+        q = query.replace("?", "%s")
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(q, params)
+        return cur
+
+    def executescript(self, script: str):
+        if self.backend == "sqlite":
+            return self.conn.executescript(script)
+        # naive split is OK for our schema scripts
+        cur = self.conn.cursor()
+        for stmt in [s.strip() for s in script.split(";") if s.strip()]:
+            cur.execute(stmt)
+        return cur
+
+
 def get_db():
     if "db" not in g:
-        db_dir = os.path.dirname(DATABASE)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-        g.db = sqlite3.connect(DATABASE)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
+        if DATABASE_URL:
+            if psycopg2 is None:
+                raise RuntimeError("psycopg2 is required when DATABASE_URL is set")
+            conn = psycopg2.connect(DATABASE_URL)
+            g.db = DB("postgres", conn)
+        else:
+            db_dir = os.path.dirname(DATABASE)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            conn = sqlite3.connect(DATABASE)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            g.db = DB("sqlite", conn)
     return g.db
 
 
@@ -66,64 +114,119 @@ def close_db(_error):
 
 def init_db():
     db = get_db()
-    db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS branches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            code TEXT,
-            shift_start TEXT NOT NULL DEFAULT '09:00',
-            shift_end TEXT NOT NULL DEFAULT '18:00',
-            allowed_ip TEXT,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL
-        );
+    if db.backend == "postgres":
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS branches (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                code TEXT,
+                shift_start TEXT NOT NULL DEFAULT '09:00',
+                shift_end TEXT NOT NULL DEFAULT '18:00',
+                allowed_ip TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS personnel (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name TEXT NOT NULL,
-            branch_id INTEGER NOT NULL,
-            monthly_salary REAL NOT NULL DEFAULT 0,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (branch_id) REFERENCES branches(id)
-        );
+            CREATE TABLE IF NOT EXISTS personnel (
+                id SERIAL PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                branch_id INTEGER NOT NULL REFERENCES branches(id),
+                monthly_salary DOUBLE PRECISION NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            personnel_id INTEGER NOT NULL,
-            branch_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            checkin_at TEXT,
-            checkout_at TEXT,
-            duration_minutes INTEGER NOT NULL DEFAULT 0,
-            source TEXT NOT NULL DEFAULT 'mobile',
-            FOREIGN KEY (personnel_id) REFERENCES personnel(id),
-            FOREIGN KEY (branch_id) REFERENCES branches(id)
-        );
+            CREATE TABLE IF NOT EXISTS attendance (
+                id SERIAL PRIMARY KEY,
+                personnel_id INTEGER NOT NULL REFERENCES personnel(id),
+                branch_id INTEGER NOT NULL REFERENCES branches(id),
+                date TEXT NOT NULL,
+                checkin_at TEXT,
+                checkout_at TEXT,
+                duration_minutes INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'mobile'
+            );
 
-        CREATE TABLE IF NOT EXISTS announcements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS announcements (
+                id SERIAL PRIMARY KEY,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS device_bindings (
-            token_hash TEXT PRIMARY KEY,
-            personnel_id INTEGER NOT NULL,
-            branch_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            FOREIGN KEY (personnel_id) REFERENCES personnel(id) ON DELETE CASCADE,
-            FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
-        );
+            CREATE TABLE IF NOT EXISTS device_bindings (
+                token_hash TEXT PRIMARY KEY,
+                personnel_id INTEGER NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+                branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        """
-    )
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+    else:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS branches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                code TEXT,
+                shift_start TEXT NOT NULL DEFAULT '09:00',
+                shift_end TEXT NOT NULL DEFAULT '18:00',
+                allowed_ip TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS personnel (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT NOT NULL,
+                branch_id INTEGER NOT NULL,
+                monthly_salary REAL NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (branch_id) REFERENCES branches(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                personnel_id INTEGER NOT NULL,
+                branch_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                checkin_at TEXT,
+                checkout_at TEXT,
+                duration_minutes INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'mobile',
+                FOREIGN KEY (personnel_id) REFERENCES personnel(id),
+                FOREIGN KEY (branch_id) REFERENCES branches(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS announcements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS device_bindings (
+                token_hash TEXT PRIMARY KEY,
+                personnel_id INTEGER NOT NULL,
+                branch_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                FOREIGN KEY (personnel_id) REFERENCES personnel(id) ON DELETE CASCADE,
+                FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
     db.commit()
     _migrate_schema(db)
 
@@ -581,7 +684,7 @@ def admin():
                     )
                     db.commit()
                     flash("Mağaza eklendi.", "success")
-                except sqlite3.IntegrityError:
+                except (sqlite3.IntegrityError, PgIntegrityError):
                     flash("Bu isimde mağaza zaten var.", "danger")
 
         elif action == "delete_branch":
