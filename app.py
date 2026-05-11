@@ -4,6 +4,7 @@ import hmac
 import os
 import secrets
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from io import StringIO
 from zoneinfo import ZoneInfo
@@ -31,6 +32,11 @@ from flask import (
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TR = ZoneInfo("Europe/Istanbul")
+
+# Mesai çıkış saatinden bu kadar dakika sonra hâlâ açık giriş varsa otomatik çıkış.
+SHIFT_END_AUTO_CHECKOUT_GRACE_MIN = 30
+_AUTO_CLOSE_MIN_INTERVAL_SEC = 45.0
+_last_auto_close_wallclock = 0.0
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "pdks-local-dev-change-me")
@@ -264,6 +270,11 @@ def _migrate_schema(db):
 @app.before_request
 def before_request():
     init_db()
+    if request.endpoint != "static":
+        try:
+            auto_close_stale_checkouts(get_db())
+        except Exception:
+            app.logger.exception("auto_close_stale_checkouts")
 
 
 def require_admin():
@@ -276,6 +287,72 @@ def now_tr():
 
 def now_str():
     return now_tr().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def branch_shift_deadline_tr(day_str: str, shift_end_hhmm: str | None) -> datetime | None:
+    """Mağaza günü için mesai çıkışı + SHIFT_END_AUTO_CHECKOUT_GRACE_MIN (Europe/Istanbul)."""
+    se = parse_hhmm(shift_end_hhmm) or "18:00"
+    try:
+        base = datetime.strptime(f"{day_str} {se}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return base.replace(tzinfo=TR) + timedelta(minutes=SHIFT_END_AUTO_CHECKOUT_GRACE_MIN)
+
+
+def auto_close_stale_checkouts(db):
+    """Açık giriş kayıtlarını mesai bitişi + tolerans sonrası kapatır (siteye gelen isteklerde, seyrek)."""
+    global _last_auto_close_wallclock
+    wall = time.time()
+    if wall - _last_auto_close_wallclock < _AUTO_CLOSE_MIN_INTERVAL_SEC:
+        return
+    _last_auto_close_wallclock = wall
+
+    now = now_tr()
+    today_s = now.strftime("%Y-%m-%d")
+    rows = db.execute(
+        """
+        SELECT a.id, a.date, a.checkin_at, b.shift_end
+        FROM attendance a
+        JOIN branches b ON b.id = a.branch_id
+        WHERE a.checkout_at IS NULL
+          AND a.checkin_at IS NOT NULL
+          AND a.date <= ?
+        """,
+        (today_s,),
+    ).fetchall()
+
+    for row in rows:
+        day_str = row["date"]
+        deadline = branch_shift_deadline_tr(day_str, row["shift_end"])
+        if not deadline:
+            continue
+        ci = _parse_ts_tr(row["checkin_at"])
+        if not ci:
+            continue
+
+        if day_str == today_s:
+            if now < deadline:
+                continue
+        else:
+            # Önceki günlerden kalan açık kayıt: ilk uygun istekte kapat.
+            pass
+
+        if ci > deadline:
+            co = now
+        else:
+            co = deadline
+
+        checkout_s = co.strftime("%Y-%m-%d %H:%M:%S")
+        duration = _minutes_between(ci, co)
+        db.execute(
+            """
+            UPDATE attendance
+            SET checkout_at = ?, duration_minutes = ?, source = 'auto'
+            WHERE id = ? AND checkout_at IS NULL
+            """,
+            (checkout_s, duration, row["id"]),
+        )
+    db.commit()
 
 
 def _parse_ts(s):
