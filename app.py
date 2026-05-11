@@ -80,10 +80,10 @@ class DB:
     def executescript(self, script: str):
         if self.backend == "sqlite":
             return self.conn.executescript(script)
-        # naive split is OK for our schema scripts
         cur = self.conn.cursor()
         for stmt in [s.strip() for s in script.split(";") if s.strip()]:
             cur.execute(stmt)
+        self.conn.commit()
         return cur
 
 
@@ -232,14 +232,31 @@ def init_db():
 
 
 def _migrate_schema(db):
-    bcols = [r["name"] for r in db.execute("PRAGMA table_info(branches)").fetchall()]
-    if "allowed_ip" not in bcols:
-        db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
-        db.commit()
-        bcols.append("allowed_ip")
-    if "active" not in bcols:
-        db.execute("ALTER TABLE branches ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-        db.commit()
+    if db.backend == "postgres":
+        # Postgres: information_schema kullan
+        cur = db.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'branches'
+            """
+        )
+        bcols = [r["column_name"] for r in cur.fetchall()]
+        if "allowed_ip" not in bcols:
+            db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
+            db.commit()
+        if "active" not in bcols:
+            db.execute("ALTER TABLE branches ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+            db.commit()
+    else:
+        # SQLite: PRAGMA kullan
+        bcols = [r["name"] for r in db.execute("PRAGMA table_info(branches)").fetchall()]
+        if "allowed_ip" not in bcols:
+            db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
+            db.commit()
+            bcols.append("allowed_ip")
+        if "active" not in bcols:
+            db.execute("ALTER TABLE branches ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+            db.commit()
     db.execute("UPDATE branches SET active = 1 WHERE active IS NULL")
     db.commit()
 
