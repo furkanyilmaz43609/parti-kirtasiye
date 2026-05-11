@@ -5,7 +5,6 @@ import os
 import secrets
 import sqlite3
 import time
-from calendar import monthrange
 from datetime import datetime, timedelta
 from io import StringIO
 from zoneinfo import ZoneInfo
@@ -33,22 +32,6 @@ from flask import (
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TR = ZoneInfo("Europe/Istanbul")
-
-MONTH_NAMES_TR = (
-    "",
-    "Ocak",
-    "Şubat",
-    "Mart",
-    "Nisan",
-    "Mayıs",
-    "Haziran",
-    "Temmuz",
-    "Ağustos",
-    "Eylül",
-    "Ekim",
-    "Kasım",
-    "Aralık",
-)
 
 # Mesai çıkış saatinden bu kadar dakika sonra hâlâ açık giriş varsa otomatik çıkış.
 SHIFT_END_AUTO_CHECKOUT_GRACE_MIN = 30
@@ -630,20 +613,6 @@ def branch_shift_moment_on_day_tr(day_str: str, hhmm: str | None, default_hhmm: 
         return None
 
 
-def parse_summary_month_param(raw: str | None, ref: datetime) -> tuple[int, int]:
-    s = (raw or "").strip()
-    if len(s) == 7 and s[4] == "-":
-        try:
-            y = int(s[:4])
-            m = int(s[5:7])
-            if 1 <= m <= 12 and 2000 <= y <= 2100:
-                return y, m
-        except ValueError:
-            pass
-    d = ref.date()
-    return d.year, d.month
-
-
 def fetch_today_dashboard_summary(db):
     """Bugün (TR): içeridekiler, mesai başına geç gelenler, mesai bitimini geçirip hâlâ içeride olanlar."""
     now = now_tr()
@@ -722,62 +691,6 @@ def fetch_today_dashboard_summary(db):
         "late_arrivals": late_arrivals,
         "past_shift_inside": past_shift_inside,
     }
-
-
-def monthly_hours_by_personnel(db, year: int, month: int):
-    """Seçilen takvim ayı için personel bazlı toplam çalışma (tamamlanan + bugün açıksa canlı)."""
-    _, last_d = monthrange(year, month)
-    start_s = f"{year:04d}-{month:02d}-01"
-    end_s = f"{year:04d}-{month:02d}-{last_d:02d}"
-    now = now_tr()
-    today_s = now.strftime("%Y-%m-%d")
-
-    people = db.execute(
-        """
-        SELECT p.id, p.full_name, b.name AS branch_name
-        FROM personnel p
-        JOIN branches b ON b.id = p.branch_id
-        ORDER BY LOWER(p.full_name), p.full_name
-        """
-    ).fetchall()
-
-    rows = db.execute(
-        """
-        SELECT personnel_id, date, checkin_at, checkout_at, duration_minutes
-        FROM attendance
-        WHERE date >= ? AND date <= ?
-        """,
-        (start_s, end_s),
-    ).fetchall()
-
-    tot = {int(p["id"]): 0 for p in people}
-    for r in rows:
-        pid = int(r["personnel_id"])
-        if pid not in tot:
-            continue
-        if r["checkout_at"]:
-            tot[pid] += int(r["duration_minutes"] or 0)
-        elif r["checkin_at"] and r["date"] == today_s and start_s <= today_s <= end_s:
-            ci = _parse_ts_tr(r["checkin_at"])
-            if ci:
-                tot[pid] += _minutes_between(ci, now)
-
-    out = []
-    for p in people:
-        pid = int(p["id"])
-        m = tot.get(pid, 0)
-        out.append(
-            {
-                "personnel_id": pid,
-                "full_name": p["full_name"],
-                "branch_name": p["branch_name"],
-                "total_minutes": m,
-                "total_hm": format_duration_tr(m),
-                "total_hours": round(m / 60.0, 2),
-            }
-        )
-    out.sort(key=lambda x: (-x["total_minutes"], x["full_name"].lower()))
-    return out
 
 
 def personnel_work_stats(db, personnel_id: int):
@@ -1069,12 +982,7 @@ def admin():
         "SELECT id, content, created_at FROM announcements ORDER BY id DESC LIMIT 20"
     ).fetchall()
 
-    now_admin = now_tr()
-    summ_y, summ_m = parse_summary_month_param(request.args.get("ozet_ay"), now_admin)
     today_summary = fetch_today_dashboard_summary(db)
-    monthly_hours_rows = monthly_hours_by_personnel(db, summ_y, summ_m)
-    summary_month_value = f"{summ_y:04d}-{summ_m:02d}"
-    summary_month_title = f"{MONTH_NAMES_TR[summ_m]} {summ_y}"
 
     selected_pid = request.args.get("pid", type=int)
     selected_start = (request.args.get("start_date") or "").strip()
@@ -1107,9 +1015,6 @@ def admin():
         attendance_rows=attendance_rows,
         latest_notes=latest_notes,
         today_summary=today_summary,
-        monthly_hours_rows=monthly_hours_rows,
-        summary_month_value=summary_month_value,
-        summary_month_title=summary_month_title,
         selected_pid=selected_pid,
         sel_name=sel_name,
         sel_stats=sel_stats,

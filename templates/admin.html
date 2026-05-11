@@ -255,42 +255,6 @@
                 </div>
             </div>
 
-            <div class="card-s p-4 mb-4">
-                <div class="section-title mb-2">Aylık toplam saat (personel)</div>
-                <p class="small text-secondary mb-3">{{ summary_month_title }} · tamamlanan çıkışlar + seçilen ay içindeyse bugünün açık vardiyası</p>
-                <form method="get" class="row g-2 align-items-end flex-wrap mb-3">
-                    <div class="col-auto">
-                        <label class="form-label small text-secondary mb-0">Ay seç</label>
-                        <input type="month" class="form-control form-control-sm" name="ozet_ay" value="{{ summary_month_value }}">
-                    </div>
-                    <div class="col-auto">
-                        <button type="submit" class="btn btn-sm btn-outline-light">Göster</button>
-                    </div>
-                    {% if selected_pid %}<input type="hidden" name="pid" value="{{ selected_pid }}">{% endif %}
-                    {% if selected_start %}<input type="hidden" name="start_date" value="{{ selected_start }}">{% endif %}
-                    {% if selected_end %}<input type="hidden" name="end_date" value="{{ selected_end }}">{% endif %}
-                </form>
-                <div class="table-responsive rounded-2" style="max-height:min(50vh,420px)">
-                    <table class="table table-sm compact table-darkish mb-0">
-                        <thead class="sticky-top sticky-head border-bottom border-secondary"><tr>
-                            <th>Personel</th><th>Mağaza</th><th class="text-end">Saat</th><th class="text-end">Süre</th>
-                        </tr></thead>
-                        <tbody>
-                        {% for row in monthly_hours_rows %}
-                            <tr>
-                                <td><a class="link-light link-underline-opacity-50" href="{{ url_for('admin', pid=row.personnel_id, ozet_ay=summary_month_value) }}">{{ row.full_name }}</a></td>
-                                <td class="small text-secondary">{{ row.branch_name }}</td>
-                                <td class="text-end text-nowrap">{{ row.total_hours }}</td>
-                                <td class="text-end text-nowrap">{{ row.total_hm }}</td>
-                            </tr>
-                        {% else %}
-                            <tr><td colspan="4" class="text-secondary">Personel yok</td></tr>
-                        {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
             {% if sel_stats and sel_name %}
             <div class="card-s p-4 mb-4">
                 <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
