@@ -516,21 +516,16 @@ def _migrate_schema(db):
 
 @app.before_request
 def before_request():
-    ep = request.endpoint or ""
-    if ep in ("static", "diag", "health"):
-        if ep == "static":
-            return None
-        # diag/health: init hata verse bile endpoint kendi yakalasın
-        try:
-            init_db()
-        except Exception:
-            app.logger.exception("init_db failed (diag/health)")
+    path = request.path or ""
+    # Teşhis ve sağlık: before_request yüzünden 500 olmasın
+    if path in ("/diag", "/health") or path.startswith("/static"):
         return None
     try:
         init_db()
     except Exception:
         app.logger.exception("init_db failed")
         raise
+    ep = request.endpoint or ""
     if session.get("is_admin") and ep not in ("index", "logout"):
         last = session.get("admin_last_active")
         now_ts = time.time()
@@ -545,16 +540,6 @@ def before_request():
     except Exception:
         app.logger.exception("auto_close_stale_checkouts")
     return None
-
-
-@app.errorhandler(500)
-def handle_500(err):
-    app.logger.exception("internal_server_error: %s", err)
-    return (
-        "<h1>Internal Server Error</h1>"
-        "<p>Sunucu hatası. Render → Logs sekmesinden kırmızı satırlara bakın.</p>",
-        500,
-    )
 
 
 def require_admin():
@@ -1229,10 +1214,24 @@ def logout():
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
+    import traceback
+
     if not require_admin():
         flash("Önce giriş yapın.", "info")
         return redirect(url_for("index", next=request.path))
 
+    try:
+        return _admin_impl()
+    except Exception:
+        app.logger.exception("admin_failed")
+        return Response(
+            "ADMIN HATA\n\n" + traceback.format_exc(),
+            status=500,
+            mimetype="text/plain; charset=utf-8",
+        )
+
+
+def _admin_impl():
     db = get_db()
 
     if request.method == "POST":
@@ -1792,11 +1791,21 @@ def health():
 
 @app.get("/diag")
 def diag():
-    """Geçici teşhis — hata metnini düz yazı döner. Sorun çözülünce kaldırılacak."""
+    """Geçici teşhis — hata metnini düz yazı döner."""
     import traceback
 
     lines = []
+    needing = []
+    dups = []
+    summary = {
+        "date_label": "-",
+        "inside": [],
+        "inside_count": 0,
+        "missing_today": [],
+        "past_shift_inside": [],
+    }
     try:
+        lines.append("diag_start")
         init_db()
         lines.append("init_db: ok")
         db = get_db()
@@ -1811,59 +1820,69 @@ def diag():
             "settings",
         ):
             try:
-                n = db.execute(f"SELECT COUNT(*) AS c FROM {t}").fetchone()["c"]
-                cols = ", ".join(_table_columns(db, t)[:20])
+                row = db.execute(f"SELECT COUNT(*) AS c FROM {t}").fetchone()
+                n = row["c"] if row else "?"
+                cols = ", ".join(_table_columns(db, t)[:30])
                 lines.append(f"table {t}: rows={n} cols=[{cols}]")
             except Exception as e:
-                db.rollback()
-                lines.append(f"table {t}: ERROR {e}")
-        needing, dups = personnel_needing_manual_codes(db)
-        lines.append(f"needing_codes={len(needing)} dup_groups={len(dups)}")
-        summary = fetch_today_dashboard_summary(db)
-        lines.append(
-            f"today_summary: inside={summary['inside_count']} missing={len(summary['missing_today'])}"
-        )
-        from datetime import date as _date
-
-        today = now_tr().date()
-        rows = period_missing_report(db, today.replace(day=1), today)
-        lines.append(f"period_report_rows={len(rows)}")
-        # admin template smoke: render without login context vars minimally
-        html = render_template(
-            "admin.html",
-            branches=fetch_branches(active_only=False),
-            personnel=fetch_personnel_admin(),
-            attendance_rows=[],
-            latest_notes=[],
-            today_summary=summary,
-            selected_pid=None,
-            sel_name=None,
-            sel_code=None,
-            sel_stats=None,
-            sel_range_stats=None,
-            selected_start="",
-            selected_end="",
-            sel_leaves=[],
-            leave_types=LEAVE_TYPES,
-            leave_type_labels=LEAVE_TYPE_LABELS,
-            holidays=[],
-            audit_rows=[],
-            needing_codes=needing,
-            dup_groups=dups,
-            suggested_code=next_employee_code(db),
-            q="",
-            branch_filter=None,
-            page=1,
-            total_pages=1,
-            total_att=0,
-            min_password_len=MIN_PASSWORD_LEN,
-        )
-        lines.append(f"admin_template_render: ok len={len(html)}")
-        lines.append("ALL_OK")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                lines.append(f"table {t}: ERROR {type(e).__name__}: {e}")
+        try:
+            needing, dups = personnel_needing_manual_codes(db)
+            lines.append(f"needing_codes={len(needing)} dup_groups={len(dups)}")
+        except Exception as e:
+            lines.append(f"needing_codes ERROR: {e}")
+            lines.append(traceback.format_exc())
+        try:
+            summary = fetch_today_dashboard_summary(db)
+            lines.append(
+                f"today_summary: inside={summary['inside_count']} missing={len(summary['missing_today'])}"
+            )
+        except Exception as e:
+            lines.append(f"today_summary ERROR: {e}")
+            lines.append(traceback.format_exc())
+        try:
+            html = render_template(
+                "admin.html",
+                branches=fetch_branches(active_only=False),
+                personnel=fetch_personnel_admin(),
+                attendance_rows=[],
+                latest_notes=[],
+                today_summary=summary,
+                selected_pid=None,
+                sel_name=None,
+                sel_code=None,
+                sel_stats=None,
+                sel_range_stats=None,
+                selected_start="",
+                selected_end="",
+                sel_leaves=[],
+                leave_types=LEAVE_TYPES,
+                leave_type_labels=LEAVE_TYPE_LABELS,
+                holidays=[],
+                audit_rows=[],
+                needing_codes=needing,
+                dup_groups=dups,
+                suggested_code="P0001",
+                q="",
+                branch_filter=None,
+                page=1,
+                total_pages=1,
+                total_att=0,
+                min_password_len=MIN_PASSWORD_LEN,
+            )
+            lines.append(f"admin_template_render: ok len={len(html)}")
+        except Exception as e:
+            lines.append(f"admin_template ERROR: {e}")
+            lines.append(traceback.format_exc())
+        lines.append("DONE")
     except Exception:
         lines.append("FAIL")
         lines.append(traceback.format_exc())
-    return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
+    return Response("\n".join(lines), status=200, mimetype="text/plain; charset=utf-8")
 
 
 @app.route("/tara")
