@@ -64,12 +64,13 @@
             <input type="hidden" name="next" value="{{ next or '' }}">
             <div class="mb-2">
                 <label class="form-label small">Yeni şifre</label>
-                <input type="password" class="form-control form-control-sm" name="password" required>
+                <input type="password" class="form-control form-control-sm" name="password" required minlength="8">
             </div>
             <div class="mb-3">
                 <label class="form-label small">Tekrar</label>
-                <input type="password" class="form-control form-control-sm" name="confirm_password" required>
+                <input type="password" class="form-control form-control-sm" name="confirm_password" required minlength="8">
             </div>
+            <p class="small text-secondary">En az 8 karakter</p>
             <button type="submit" class="btn btn-success w-100 btn-sm">Kaydet</button>
         </form>
     {% else %}

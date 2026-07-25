@@ -15,6 +15,7 @@
             --line: #2a313c;
             --accent: #4a9b7d;
             --accent-dim: #2d4a3e;
+            --warn: #c47a2a;
         }
         body { background: var(--page); color: var(--ink); font-family: system-ui, sans-serif; min-height: 100vh; }
         .wrap { max-width: min(1560px, 98vw); margin: 0 auto; }
@@ -26,10 +27,14 @@
         a.p-sel:hover { background: var(--surface2); }
         a.p-sel.active { background: var(--accent-dim); color: #c8f0de; }
         .stat-box { background: var(--surface2); border: 1px solid var(--line); border-radius: 8px; padding: .85rem; font-size: .9rem; }
+        .stat-box.emphasis { border-color: var(--warn); }
         .table-darkish { --bs-table-bg: var(--surface2); --bs-table-color: var(--ink); }
         thead.sticky-head { background: var(--surface) !important; }
         .form-control, .form-select { background: var(--surface2); border-color: var(--line); color: var(--ink); }
         .form-control:focus, .form-select:focus { background: var(--surface2); border-color: var(--accent); color: var(--ink); box-shadow: 0 0 0 .2rem rgba(74,155,125,.15); }
+        tr.row-auto { background: rgba(196, 122, 42, .18) !important; color: #f0c090; }
+        .badge-auto { background: #5c3a12; color: #ffc978; border: 1px solid #c47a2a; font-weight: 500; }
+        .code-pill { font-family: ui-monospace, monospace; color: #9fd4bd; }
     </style>
 </head>
 <body>
@@ -40,6 +45,8 @@
             <span class="small text-secondary text-nowrap" id="tr-clock" title="Europe/Istanbul"></span>
         </div>
         <div class="d-flex gap-2 flex-wrap">
+            <a class="btn btn-sm btn-warning" href="{{ url_for('admin_missing_hours') }}">Eksik saat raporu</a>
+            <a class="btn btn-sm btn-outline-warning" href="{{ url_for('admin_personnel_codes') }}">Personel kodları</a>
             <a class="btn btn-sm btn-outline-light" href="/personel" target="_blank">Personel ekranı</a>
             <a class="btn btn-sm btn-outline-light" href="/rapor/excel">Mesai CSV</a>
             <a class="btn btn-sm btn-light" href="/logout">Çıkış</a>
@@ -57,28 +64,32 @@
         {% endif %}
     {% endwith %}
 
+    {% if needing_codes %}
+    <div class="alert alert-warning py-2 small">
+        <strong>{{ needing_codes|length }} personel</strong> için benzersiz kod onayı gerekli (aynı isimler otomatik birleştirilmez).
+        <a href="{{ url_for('admin_personnel_codes') }}" class="alert-link">Manuel eşleştirme ekranı</a>
+    </div>
+    {% endif %}
+
     <div class="row g-4">
         <div class="col-12 col-xl-4">
 
             <div class="card-s p-3 mb-4">
-                <div class="section-title mb-2">Mağaza ekle</div>
-                <form method="post" class="row g-2">
+                <div class="section-title mb-2">Mağaza · personel</div>
+                <form method="post" class="row g-2 mb-3 pb-3 border-bottom border-secondary border-opacity-25">
                     <input type="hidden" name="action" value="add_branch">
                     {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                    <div class="col-12 small text-secondary">Yeni mağaza</div>
                     <div class="col-12"><input class="form-control form-control-sm" name="name" placeholder="Mağaza adı" required></div>
-                    <div class="col-12">
-                        <input class="form-control form-control-sm" name="allowed_ip" placeholder="Mağaza çıkış IP (virgülle birden fazla)" required>
-                    </div>
-                    <div class="col-12"><button type="submit" class="btn btn-sm w-100 text-white" style="background:var(--accent)">Kaydet</button></div>
+                    <div class="col-12"><input class="form-control form-control-sm" name="allowed_ip" placeholder="Çıkış IP" required></div>
+                    <div class="col-12"><button type="submit" class="btn btn-sm w-100 text-white" style="background:var(--accent)">Mağaza kaydet</button></div>
                 </form>
-            </div>
-
-            <div class="card-s p-3 mb-4">
-                <div class="section-title mb-2">Personel ekle</div>
                 <form method="post" class="row g-2">
                     <input type="hidden" name="action" value="add_personnel">
                     {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                    <div class="col-12"><input class="form-control form-control-sm" name="full_name" placeholder="Ad soyad" required></div>
+                    <div class="col-12 small text-secondary">Yeni personel</div>
+                    <div class="col-5"><input class="form-control form-control-sm" name="employee_code" value="{{ suggested_code }}" placeholder="Kod P0001" required></div>
+                    <div class="col-7"><input class="form-control form-control-sm" name="full_name" placeholder="Ad soyad" required></div>
                     <div class="col-12">
                         <select class="form-select form-select-sm" name="branch_id" required>
                             <option value="">Mağaza</option>
@@ -87,8 +98,61 @@
                             {% endfor %}
                         </select>
                     </div>
-                    <div class="col-12"><button type="submit" class="btn btn-sm btn-outline-light w-100">Ekle</button></div>
+                    <div class="col-12"><button type="submit" class="btn btn-sm btn-outline-light w-100">Personel ekle</button></div>
                 </form>
+            </div>
+
+            <div class="card-s p-3 mb-4">
+                <div class="section-title mb-2">Mağazalar (mesai + IP)</div>
+                <p class="small text-secondary mb-2">Mesai bitişinden 30 dk sonra açık girişler otomatik kapanır ve turuncu işaretlenir.</p>
+                {% for b in branches %}
+                <div class="mb-3 pb-3 border-bottom border-secondary border-opacity-25">
+                    <div class="small fw-semibold mb-1">{{ b.name }}</div>
+                    <form method="post" class="row g-1 align-items-center">
+                        <input type="hidden" name="action" value="set_branch_hours">
+                        <input type="hidden" name="branch_id" value="{{ b.id }}">
+                        {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
+                        <div class="col-auto"><input class="form-control form-control-sm" name="shift_start" value="{{ b.shift_start }}" style="width:4.8rem" maxlength="5"></div>
+                        <div class="col-auto text-secondary">–</div>
+                        <div class="col-auto"><input class="form-control form-control-sm" name="shift_end" value="{{ b.shift_end }}" style="width:4.8rem" maxlength="5"></div>
+                        <div class="col-12 mt-1"><input class="form-control form-control-sm" name="allowed_ip" value="{{ b['allowed_ip'] or '' }}" placeholder="IP"></div>
+                        <div class="col-12 mt-1 d-flex gap-2">
+                            <button type="submit" class="btn btn-sm btn-outline-secondary">Kaydet</button>
+                        </div>
+                    </form>
+                    <form method="post" class="mt-1" onsubmit="return confirm('Mağaza ve kayıtlar silinsin mi?');">
+                        <input type="hidden" name="action" value="delete_branch">
+                        <input type="hidden" name="branch_id" value="{{ b.id }}">
+                        <button type="submit" class="btn btn-sm btn-link text-danger p-0 small">Sil</button>
+                    </form>
+                </div>
+                {% endfor %}
+            </div>
+
+            <div class="card-s p-3 mb-4">
+                <div class="section-title mb-2">Mağaza tatili (toplu)</div>
+                <form method="post" class="row g-2">
+                    <input type="hidden" name="action" value="add_branch_holiday">
+                    <div class="col-12">
+                        <select class="form-select form-select-sm" name="branch_id" required>
+                            {% for b in branches %}{% if b.active %}<option value="{{ b.id }}">{{ b.name }}</option>{% endif %}{% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-6"><input type="date" class="form-control form-control-sm" name="start_date" required></div>
+                    <div class="col-6"><input type="date" class="form-control form-control-sm" name="end_date"></div>
+                    <div class="col-12"><input class="form-control form-control-sm" name="title" placeholder="Bayram / resmi tatil"></div>
+                    <div class="col-12"><button class="btn btn-sm btn-outline-secondary w-100" type="submit">Tatil ekle</button></div>
+                </form>
+                {% for h in holidays %}
+                <div class="d-flex justify-content-between small mt-2">
+                    <span>{{ h.branch_name }} · {{ h.title or 'Tatil' }} · {{ h.start_date|tr_iso_date }}{% if h.end_date != h.start_date %}–{{ h.end_date|tr_iso_date }}{% endif %}</span>
+                    <form method="post" class="mb-0">
+                        <input type="hidden" name="action" value="delete_branch_holiday">
+                        <input type="hidden" name="holiday_id" value="{{ h.id }}">
+                        <button class="btn btn-link btn-sm text-danger p-0">Sil</button>
+                    </form>
+                </div>
+                {% endfor %}
             </div>
 
             <div class="card-s p-3 mb-4">
@@ -96,103 +160,66 @@
                 <form method="post">
                     <input type="hidden" name="action" value="add_note">
                     {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                    <textarea class="form-control form-control-sm mb-2" name="content" rows="2" placeholder="Personel ekranında görünsün" required></textarea>
+                    <textarea class="form-control form-control-sm mb-2" name="content" rows="2" required></textarea>
                     <button type="submit" class="btn btn-sm btn-outline-secondary w-100">Yayınla</button>
                 </form>
-                {% if latest_notes %}
-                    <hr class="my-3 border-secondary opacity-25">
-                    <div class="small text-secondary mb-1">Son duyurular · sil</div>
-                    <div class="small">
-                        {% for n in latest_notes %}
-                            <div class="d-flex flex-wrap align-items-start gap-2 justify-content-between mb-2 pb-2 border-bottom border-secondary border-opacity-25">
-                                <span class="text-secondary flex-grow-1" style="min-width:140px">{{ n.content }} <span class="text-muted">· {{ n.created_at|tr_dt }}</span></span>
-                                <form method="post" class="mb-0 flex-shrink-0" onsubmit="return confirm('Bu duyuruyu silmek istediğinize emin misiniz?');">
-                                    <input type="hidden" name="action" value="delete_note">
-                                    <input type="hidden" name="announcement_id" value="{{ n.id }}">
-                                    {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                                    <button type="submit" class="btn btn-sm btn-link text-danger p-0 small text-decoration-none">Sil</button>
-                                </form>
-                            </div>
-                        {% endfor %}
-                    </div>
-                {% endif %}
+                {% for n in latest_notes %}
+                <div class="d-flex justify-content-between small mt-2 gap-2">
+                    <span class="text-secondary">{{ n.content }}</span>
+                    <form method="post" class="mb-0" onsubmit="return confirm('Silinsin mi?');">
+                        <input type="hidden" name="action" value="delete_note">
+                        <input type="hidden" name="announcement_id" value="{{ n.id }}">
+                        <button class="btn btn-link btn-sm text-danger p-0">Sil</button>
+                    </form>
+                </div>
+                {% endfor %}
             </div>
 
             <div class="card-s p-3 mb-4">
                 <div class="section-title mb-2">Yönetici şifresi</div>
                 <form method="post" class="row g-2">
                     <input type="hidden" name="action" value="change_admin_password">
-                    {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
                     <div class="col-12"><input type="password" class="form-control form-control-sm" name="current_password" placeholder="Mevcut şifre" required></div>
-                    <div class="col-12"><input type="password" class="form-control form-control-sm" name="new_password" placeholder="Yeni şifre (min. 4)" required></div>
+                    <div class="col-12"><input type="password" class="form-control form-control-sm" name="new_password" placeholder="Yeni şifre (min. {{ min_password_len }})" required minlength="{{ min_password_len }}"></div>
                     <div class="col-12"><button type="submit" class="btn btn-sm btn-outline-warning w-100">Şifreyi güncelle</button></div>
                 </form>
+                <p class="small text-secondary mt-2 mb-0">Oturum {{ (8) }} saat işlem yapılmazsa otomatik kapanır.</p>
             </div>
 
             <div class="card-s p-3 mb-4">
-                <div class="section-title mb-2">Mağazalar</div>
-                <p class="small text-secondary mb-2">Her mağazanın <strong>mesai çıkış</strong> saatinden 30 dakika sonra hâlâ çıkış yapılmamış açık girişler, bir sonraki site isteğinde otomatik kapanır (çıkış zamanı genelde mesai bitişi + 30 dk olarak kaydedilir).</p>
-                <div class="table-responsive">
-                    <table class="table table-sm compact table-darkish mb-0">
-                        <thead><tr><th>Ad</th><th colspan="2">IP · işlem</th></tr></thead>
-                        <tbody>
-                        {% for b in branches %}
-                            <tr>
-                                <td class="small">{{ b.name }}</td>
-                                <td colspan="2" class="p-2">
-                                    <div class="small text-secondary mb-1">Mesai (giriş–çıkış)</div>
-                                    <form method="post" class="d-flex gap-1 flex-wrap align-items-center mb-2">
-                                        <input type="hidden" name="action" value="set_branch_hours">
-                                        <input type="hidden" name="branch_id" value="{{ b.id }}">
-                                        {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                                        <input class="form-control form-control-sm" name="shift_start" value="{{ b.shift_start }}" placeholder="09:00" style="max-width:5.2rem" maxlength="5">
-                                        <span class="text-secondary">–</span>
-                                        <input class="form-control form-control-sm" name="shift_end" value="{{ b.shift_end }}" placeholder="18:00" style="max-width:5.2rem" maxlength="5">
-                                        <button type="submit" class="btn btn-sm btn-outline-secondary">Kaydet</button>
-                                    </form>
-                                    <form method="post" class="d-flex gap-1 flex-wrap mb-2">
-                                        <input type="hidden" name="action" value="set_branch_ip">
-                                        <input type="hidden" name="branch_id" value="{{ b.id }}">
-                                        {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                                        <input class="form-control form-control-sm flex-grow-1" name="allowed_ip" value="{{ b['allowed_ip'] or '' }}" style="min-width:100px" placeholder="IP">
-                                        <button type="submit" class="btn btn-sm btn-outline-secondary">Güncelle</button>
-                                    </form>
-                                    <form method="post" class="mb-0" onsubmit="return confirm('Bu mağazayı ve tüm bağlı kayıtları tamamen silmek istediğinize emin misiniz?');">
-                                        <input type="hidden" name="action" value="delete_branch">
-                                        <input type="hidden" name="branch_id" value="{{ b.id }}">
-                                        {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                                        <button type="submit" class="btn btn-sm btn-link text-danger p-0 small text-decoration-none">Sil</button>
-                                    </form>
-                                </td>
-                            </tr>
-                        {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card-s p-3">
                 <div class="section-title mb-2">Personel listesi</div>
-                <p class="small text-secondary mb-2">İsim: özet görülsün · Sil: tamamen kaldır</p>
+                <form method="get" class="mb-2">
+                    {% if selected_pid %}<input type="hidden" name="pid" value="{{ selected_pid }}">{% endif %}
+                    <input class="form-control form-control-sm" name="q" value="{{ q }}" placeholder="Kod / isim / mağaza ara">
+                </form>
                 {% for p in personnel %}
                     <div class="d-flex align-items-center gap-2 py-2 border-bottom border-secondary border-opacity-25 flex-wrap">
-                        <a class="p-sel flex-grow-1 {{ 'active' if selected_pid == p.id else '' }}" href="{{ url_for('admin', pid=p.id) }}">{{ p.full_name }}</a>
+                        <a class="p-sel flex-grow-1 {{ 'active' if selected_pid == p.id else '' }}" href="{{ url_for('admin', pid=p.id, q=q) }}">
+                            <span class="code-pill">{{ p.employee_code or '—Kod yok—' }}</span> {{ p.full_name }}
+                        </a>
                         <span class="text-secondary small">{{ p.branch_name }}</span>
-                        <form method="post" class="mb-0 ms-auto" onsubmit="return confirm('Personeli ve mesai geçmişini tamamen silmek istediğinize emin misiniz?');">
+                        <form method="post" class="mb-0" onsubmit="return confirm('Personel silinsin mi?');">
                             <input type="hidden" name="action" value="delete_personnel">
                             <input type="hidden" name="personnel_id" value="{{ p.id }}">
-                            {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
                             <button type="submit" class="btn btn-sm btn-outline-danger">Sil</button>
                         </form>
-                        <form method="post" class="mb-0" onsubmit="return confirm('Bu personelin cihaz eşleştirmesi sıfırlansın mı?');">
+                        <form method="post" class="mb-0">
                             <input type="hidden" name="action" value="reset_device_binding">
                             <input type="hidden" name="personnel_id" value="{{ p.id }}">
-                            {% if selected_pid %}<input type="hidden" name="return_pid" value="{{ selected_pid }}">{% endif %}
-                            <button type="submit" class="btn btn-sm btn-outline-secondary">Cihaz sıfırla</button>
+                            <button type="submit" class="btn btn-sm btn-outline-secondary">Cihaz</button>
                         </form>
                     </div>
                 {% else %}
-                    <span class="text-secondary small">Henüz personel yok.</span>
+                    <span class="text-secondary small">Kayıt yok / arama boş.</span>
+                {% endfor %}
+            </div>
+
+            <div class="card-s p-3">
+                <div class="section-title mb-2">İşlem günlüğü</div>
+                {% for a in audit_rows %}
+                <div class="small text-secondary mb-1">{{ a.created_at|tr_dt }} · <span class="text-light">{{ a.action }}</span> · {{ a.detail }}</div>
+                {% else %}
+                <div class="small text-secondary">Henüz log yok.</div>
                 {% endfor %}
             </div>
         </div>
@@ -202,54 +229,42 @@
                 <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
                     <div>
                         <div class="section-title">Bugünkü özet</div>
-                        <div class="text-secondary small mt-1">{{ today_summary.date_label }} · mesai saatleri mağaza satırından</div>
+                        <div class="text-secondary small mt-1">{{ today_summary.date_label }} · ana metrik: eksik süre</div>
                     </div>
                     <button type="button" class="btn btn-sm btn-outline-light" onclick="location.reload()">Yenile</button>
                 </div>
                 <div class="row g-3">
                     <div class="col-md-4">
                         <div class="stat-box h-100">
-                            <div class="text-secondary small">İçeride (çıkış yok)</div>
+                            <div class="text-secondary small">İçeride</div>
                             <div class="fs-2 fw-semibold mt-1">{{ today_summary.inside_count }}</div>
-                            {% if today_summary.inside %}
-                                <ul class="small mt-2 mb-0 ps-3">
-                                    {% for x in today_summary.inside %}
-                                        <li class="mb-2"><span class="text-light">{{ x.full_name }}</span> <span class="text-secondary">· {{ x.branch_name }}</span><br><span class="text-muted">Giriş {{ x.checkin_label }}</span></li>
-                                    {% endfor %}
-                                </ul>
-                            {% else %}
-                                <p class="small text-secondary mt-2 mb-0">Bugün şu an içeride kayıtlı kimse yok.</p>
-                            {% endif %}
+                            <ul class="small mt-2 mb-0 ps-3">
+                                {% for x in today_summary.inside %}
+                                <li class="mb-1"><span class="code-pill">{{ x.employee_code }}</span> {{ x.full_name }} · {{ x.branch_name }}</li>
+                                {% else %}<li class="text-secondary">Yok</li>{% endfor %}
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="stat-box emphasis h-100">
+                            <div class="text-secondary small">Bugün eksik süresi olanlar</div>
+                            <div class="fs-6 fw-semibold mt-1">{{ today_summary.missing_today|length }} kişi</div>
+                            <ul class="small mt-2 mb-0 ps-3">
+                                {% for x in today_summary.missing_today[:12] %}
+                                <li class="mb-1">{{ x.label }} · <strong>{{ x.missing_hm }}</strong></li>
+                                {% else %}<li class="text-secondary">Yok / herkes izinli veya tamam</li>{% endfor %}
+                            </ul>
                         </div>
                     </div>
                     <div class="col-md-4">
                         <div class="stat-box h-100">
-                            <div class="text-secondary small">Mesai başına geç gelenler</div>
-                            <div class="fs-6 fw-semibold mt-1">{{ today_summary.late_arrivals|length }} kişi</div>
-                            {% if today_summary.late_arrivals %}
-                                <ul class="small mt-2 mb-0 ps-3">
-                                    {% for x in today_summary.late_arrivals %}
-                                        <li class="mb-2"><span class="text-light">{{ x.full_name }}</span> <span class="text-secondary">· {{ x.branch_name }}</span><br><span class="text-muted">{{ x.checkin_label }} ({{ x.late_hm }} geç)</span></li>
-                                    {% endfor %}
-                                </ul>
-                            {% else %}
-                                <p class="small text-secondary mt-2 mb-0">Bugün mesai başlangıcına geç kalan yok.</p>
-                            {% endif %}
-                        </div>
-                    </div>
-                    <div class="col-md-4">
-                        <div class="stat-box h-100">
-                            <div class="text-secondary small">Mesai bitimini geçirip hâlâ içeride</div>
-                            <div class="fs-6 fw-semibold mt-1">{{ today_summary.past_shift_inside|length }} kişi</div>
-                            {% if today_summary.past_shift_inside %}
-                                <ul class="small mt-2 mb-0 ps-3">
-                                    {% for x in today_summary.past_shift_inside %}
-                                        <li class="mb-2"><span class="text-light">{{ x.full_name }}</span> <span class="text-secondary">· {{ x.branch_name }}</span><br><span class="text-muted">Giriş {{ x.checkin_label }}</span></li>
-                                    {% endfor %}
-                                </ul>
-                            {% else %}
-                                <p class="small text-secondary mt-2 mb-0">Mesai çıkış saatini geçmiş açık kayıt yok.</p>
-                            {% endif %}
+                            <div class="text-secondary small">Mesai bitmiş, hâlâ içeride</div>
+                            <div class="fs-6 fw-semibold mt-1">{{ today_summary.past_shift_inside|length }}</div>
+                            <ul class="small mt-2 mb-0 ps-3">
+                                {% for x in today_summary.past_shift_inside %}
+                                <li>{{ x.label }} · {{ x.branch_name }}</li>
+                                {% else %}<li class="text-secondary">Yok</li>{% endfor %}
+                            </ul>
                         </div>
                     </div>
                 </div>
@@ -260,7 +275,7 @@
                 <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
                     <div>
                         <div class="section-title">Seçilen personel</div>
-                        <div class="h5 mb-0 mt-1">{{ sel_name }}</div>
+                        <div class="h5 mb-0 mt-1"><span class="code-pill">{{ sel_code or '—' }}</span> {{ sel_name }}</div>
                     </div>
                     <a href="{{ url_for('admin') }}" class="small text-secondary">Temizle</a>
                 </div>
@@ -277,70 +292,132 @@
                     <div class="col-sm-2 d-grid">
                         <button type="submit" class="btn btn-sm btn-outline-light">Uygula</button>
                     </div>
-                    <div class="col-12">
-                        <a href="{{ url_for('admin', pid=selected_pid) }}" class="small text-secondary">Aralığı temizle</a>
-                    </div>
                 </form>
                 <div class="row g-3 mt-2">
                     <div class="col-md-4">
-                        <div class="stat-box">
-                            <div class="text-secondary small">Bugün</div>
-                            <div class="fs-5 fw-semibold mt-1">{{ sel_stats.today_hm }}</div>
+                        <div class="stat-box emphasis">
+                            <div class="text-secondary small">Bugün eksik</div>
+                            <div class="fs-5 fw-semibold mt-1">{{ sel_stats.today_missing_hm }}</div>
+                            <div class="small text-secondary mt-1">Fiili: {{ sel_stats.today_worked_hm }}</div>
                         </div>
                     </div>
                     <div class="col-md-4">
-                        <div class="stat-box">
-                            <div class="text-secondary small">Bu hafta (Pzt–Paz)</div>
-                            <div class="fs-6 fw-semibold mt-1">{{ sel_stats.week_days }} gün</div>
-                            <div class="mt-1">{{ sel_stats.week_hm }}</div>
+                        <div class="stat-box emphasis">
+                            <div class="text-secondary small">Bu hafta eksik</div>
+                            <div class="fs-6 fw-semibold mt-1">{{ sel_stats.week_missing_hm }}</div>
+                            <div class="small text-secondary mt-1">İzin: {{ sel_stats.week_leave_days }} gün · Fiili {{ sel_stats.week_worked_hm }}</div>
                         </div>
                     </div>
                     <div class="col-md-4">
-                        <div class="stat-box">
-                            <div class="text-secondary small">Bu ay</div>
-                            <div class="fs-6 fw-semibold mt-1">{{ sel_stats.month_days }} gün</div>
-                            <div class="mt-1">{{ sel_stats.month_hm }}</div>
+                        <div class="stat-box emphasis">
+                            <div class="text-secondary small">Bu ay eksik</div>
+                            <div class="fs-6 fw-semibold mt-1">{{ sel_stats.month_missing_hm }}</div>
+                            <div class="small text-secondary mt-1">İzinli/tatil günleri: {{ sel_stats.month_leave_days }} gün</div>
                         </div>
                     </div>
                 </div>
                 {% if sel_range_stats %}
-                <div class="stat-box mt-3">
-                    <div class="text-secondary small">Seçilen aralık ({{ sel_range_stats.start_label }} - {{ sel_range_stats.end_label }})</div>
-                    <div class="fs-6 fw-semibold mt-1">{{ sel_range_stats.range_days }} gün</div>
-                    <div class="mt-1">{{ sel_range_stats.range_hm }}</div>
+                <div class="stat-box emphasis mt-3">
+                    <div class="text-secondary small">Seçilen aralık eksik ({{ sel_range_stats.start_label }} – {{ sel_range_stats.end_label }})</div>
+                    <div class="fs-5 fw-semibold mt-1">{{ sel_range_stats.range_missing_hm }}</div>
+                    <div class="small mt-1">Fiili {{ sel_range_stats.range_worked_hm }} · İzin {{ sel_range_stats.range_leave_days }} gün · Hesaplanan {{ sel_range_stats.range_days }} gün</div>
+                    {% if sel_range_stats.auto_closed_days %}
+                    <div class="small text-warning mt-1">⚠ {{ sel_range_stats.auto_closed_days }} günde otomatik kapanmış kayıt var (süre hesaba dahil edilmedi).</div>
+                    {% endif %}
                 </div>
                 {% endif %}
-                <p class="small text-secondary mt-3 mb-0">Süreler Türkiye saatiyle hesaplanır (tamamlanan kayıtlar + bugün açıksa güncel vardiya).</p>
+
+                <div class="mt-4">
+                    <div class="section-title mb-2">İzin / tatil ata</div>
+                    <form method="post" class="row g-2 align-items-end">
+                        <input type="hidden" name="action" value="add_leave">
+                        <input type="hidden" name="personnel_id" value="{{ selected_pid }}">
+                        <input type="hidden" name="return_pid" value="{{ selected_pid }}">
+                        <div class="col-sm-3"><input type="date" class="form-control form-control-sm" name="start_date" required></div>
+                        <div class="col-sm-3"><input type="date" class="form-control form-control-sm" name="end_date"></div>
+                        <div class="col-sm-3">
+                            <select class="form-select form-select-sm" name="leave_type">
+                                {% for val, lab in leave_types %}<option value="{{ val }}">{{ lab }}</option>{% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-sm-3"><button class="btn btn-sm btn-outline-light w-100" type="submit">Kaydet</button></div>
+                        <div class="col-12"><input class="form-control form-control-sm" name="note" placeholder="Not (opsiyonel)"></div>
+                    </form>
+                    {% for L in sel_leaves %}
+                    <div class="d-flex justify-content-between small mt-2">
+                        <span>{{ leave_type_labels.get(L.leave_type, L.leave_type) }} · {{ L.start_date|tr_iso_date }}{% if L.end_date != L.start_date %}–{{ L.end_date|tr_iso_date }}{% endif %}</span>
+                        <form method="post" class="mb-0">
+                            <input type="hidden" name="action" value="delete_leave">
+                            <input type="hidden" name="leave_id" value="{{ L.id }}">
+                            <input type="hidden" name="return_pid" value="{{ selected_pid }}">
+                            <button class="btn btn-link btn-sm text-danger p-0">Sil</button>
+                        </form>
+                    </div>
+                    {% endfor %}
+                </div>
             </div>
             {% else %}
             <div class="card-s p-4 mb-4 text-secondary small">
-                Soldan bir personel adına tıklayın; yalnızca seçtiğiniz kişinin bugün / hafta / ay özeti burada görünür (üçü aynı anda değil, odak tek kişi).
+                Soldan personel seçin (kod ile). Tüm personel için dönemsel eksik saat: <a href="{{ url_for('admin_missing_hours') }}">Eksik saat raporu</a>.
             </div>
             {% endif %}
 
             <div class="card-s p-4">
-                <span class="section-title">Canlı mesai</span>
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                    <span class="section-title mb-0">Canlı mesai</span>
+                    <form method="get" class="d-flex gap-2 flex-wrap">
+                        {% if selected_pid %}<input type="hidden" name="pid" value="{{ selected_pid }}">{% endif %}
+                        <input class="form-control form-control-sm" name="q" value="{{ q }}" placeholder="Ara…" style="width:9rem">
+                        <select class="form-select form-select-sm" name="branch_filter" style="width:9rem">
+                            <option value="">Tüm mağazalar</option>
+                            {% for b in branches %}<option value="{{ b.id }}" {% if branch_filter == b.id %}selected{% endif %}>{{ b.name }}</option>{% endfor %}
+                        </select>
+                        <button class="btn btn-sm btn-outline-light" type="submit">Filtrele</button>
+                    </form>
+                </div>
                 <div class="table-responsive mt-3 rounded-2 overflow-hidden" style="max-height:min(70vh,640px)">
                     <table class="table table-sm compact table-darkish mb-0">
                         <thead class="sticky-top sticky-head border-bottom border-secondary"><tr>
-                            <th>İsim</th><th>Mağaza</th><th>Tarih</th><th>Giriş</th><th>Çıkış</th><th>Süre</th>
+                            <th>Kod</th><th>İsim</th><th>Mağaza</th><th>Tarih</th><th>Giriş</th><th>Çıkış</th><th>Süre</th><th></th>
                         </tr></thead>
                         <tbody>
                         {% for a in attendance_rows %}
-                            <tr>
+                            <tr class="{% if a.auto_closed %}row-auto{% endif %}">
+                                <td class="code-pill">{{ a.employee_code or '—' }}</td>
                                 <td><a href="{{ url_for('admin', pid=a.personnel_id) }}" class="link-light link-underline-opacity-50">{{ a.full_name }}</a></td>
                                 <td>{{ a.branch_name }}</td>
                                 <td>{{ a.date|tr_iso_date }}</td>
                                 <td class="text-nowrap small">{{ a.checkin_at|tr_dt if a.checkin_at else '—' }}</td>
-                                <td class="text-nowrap small">{{ a.checkout_at|tr_dt if a.checkout_at else '—' }}</td>
+                                <td class="text-nowrap small">
+                                    {{ a.checkout_at|tr_dt if a.checkout_at else '—' }}
+                                    {% if a.auto_closed %}<span class="badge badge-auto ms-1">⚠ otomatik kapatıldı</span>{% endif %}
+                                </td>
                                 <td>{% if a.checkout_at %}{{ a.duration_minutes|sure_tr }}{% else %}<span class="text-secondary">Açık</span>{% endif %}</td>
+                                <td>
+                                    {% if a.auto_closed %}
+                                    <form method="post" class="d-flex gap-1 flex-wrap">
+                                        <input type="hidden" name="action" value="correct_attendance">
+                                        <input type="hidden" name="attendance_id" value="{{ a.id }}">
+                                        <input type="hidden" name="clear_auto_closed" value="1">
+                                        <input class="form-control form-control-sm" name="checkout_at" value="{{ a.checkout_at or '' }}" style="width:11rem" title="YYYY-MM-DD HH:MM:SS">
+                                        <button class="btn btn-sm btn-outline-warning" type="submit">Düzelt</button>
+                                    </form>
+                                    {% endif %}
+                                </td>
                             </tr>
                         {% else %}
-                            <tr><td colspan="6" class="text-secondary">Kayıt yok</td></tr>
+                            <tr><td colspan="8" class="text-secondary">Kayıt yok</td></tr>
                         {% endfor %}
                         </tbody>
                     </table>
                 </div>
+                {% if total_pages > 1 %}
+                <div class="d-flex gap-2 mt-3 align-items-center small">
+                    <span class="text-secondary">{{ total_att }} kayıt · sayfa {{ page }}/{{ total_pages }}</span>
+                    {% if page > 1 %}<a class="btn btn-sm btn-outline-secondary" href="{{ url_for('admin', page=page-1, q=q, branch_filter=branch_filter or '', pid=selected_pid or '') }}">Önceki</a>{% endif %}
+                    {% if page < total_pages %}<a class="btn btn-sm btn-outline-secondary" href="{{ url_for('admin', page=page+1, q=q, branch_filter=branch_filter or '', pid=selected_pid or '') }}">Sonraki</a>{% endif %}
+                </div>
+                {% endif %}
             </div>
         </div>
     </div>

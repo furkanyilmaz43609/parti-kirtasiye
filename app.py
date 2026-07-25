@@ -30,6 +30,21 @@ from flask import (
     url_for,
 )
 
+from pdks_logic import (
+    LEAVE_TYPE_LABELS,
+    LEAVE_TYPES,
+    attendance_counts_as_work,
+    day_in_range,
+    duplicate_name_groups,
+    format_duration_tr as logic_format_duration_tr,
+    iter_dates,
+    minutes_from_attendance_row,
+    missing_minutes_for_day,
+    parse_hhmm as logic_parse_hhmm,
+    shift_length_minutes,
+    suggest_next_code,
+)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TR = ZoneInfo("Europe/Istanbul")
 
@@ -37,6 +52,11 @@ TR = ZoneInfo("Europe/Istanbul")
 SHIFT_END_AUTO_CHECKOUT_GRACE_MIN = 30
 _AUTO_CLOSE_MIN_INTERVAL_SEC = 45.0
 _last_auto_close_wallclock = 0.0
+
+MIN_PASSWORD_LEN = 8
+ADMIN_SESSION_IDLE_SEC = 8 * 60 * 60  # 8 saat işlem yoksa oturum düşer
+# Not: IP whitelist tek başına konum doğrulaması değildir; ileride QR / cihaz
+# eşleştirme gibi ikinci katman değerlendirilebilir (cihaz bağlama zaten kısmen var).
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "pdks-local-dev-change-me")
@@ -137,6 +157,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS personnel (
                 id SERIAL PRIMARY KEY,
                 full_name TEXT NOT NULL,
+                employee_code TEXT UNIQUE,
+                code_confirmed INTEGER NOT NULL DEFAULT 0,
                 branch_id INTEGER NOT NULL REFERENCES branches(id),
                 monthly_salary DOUBLE PRECISION NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
@@ -151,7 +173,8 @@ def init_db():
                 checkin_at TEXT,
                 checkout_at TEXT,
                 duration_minutes INTEGER NOT NULL DEFAULT 0,
-                source TEXT NOT NULL DEFAULT 'mobile'
+                source TEXT NOT NULL DEFAULT 'mobile',
+                auto_closed INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS announcements (
@@ -172,6 +195,33 @@ def init_db():
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS personnel_leaves (
+                id SERIAL PRIMARY KEY,
+                personnel_id INTEGER NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                leave_type TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS branch_holidays (
+                id SERIAL PRIMARY KEY,
+                branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                title TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT
+            );
             """
         )
     else:
@@ -191,6 +241,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS personnel (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 full_name TEXT NOT NULL,
+                employee_code TEXT UNIQUE,
+                code_confirmed INTEGER NOT NULL DEFAULT 0,
                 branch_id INTEGER NOT NULL,
                 monthly_salary REAL NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
@@ -207,6 +259,7 @@ def init_db():
                 checkout_at TEXT,
                 duration_minutes INTEGER NOT NULL DEFAULT 0,
                 source TEXT NOT NULL DEFAULT 'mobile',
+                auto_closed INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (personnel_id) REFERENCES personnel(id),
                 FOREIGN KEY (branch_id) REFERENCES branches(id)
             );
@@ -231,50 +284,206 @@ def init_db():
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS personnel_leaves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                personnel_id INTEGER NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                leave_type TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (personnel_id) REFERENCES personnel(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS branch_holidays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                branch_id INTEGER NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                title TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT
+            );
             """
         )
     db.commit()
     _migrate_schema(db)
 
 
-def _migrate_schema(db):
+def _table_columns(db, table: str) -> list[str]:
     if db.backend == "postgres":
-        # Postgres: information_schema kullan
         cur = db.execute(
             """
             SELECT column_name FROM information_schema.columns
-            WHERE table_name = 'branches'
+            WHERE table_schema = 'public' AND table_name = ?
+            """,
+            (table,),
+        )
+        return [r["column_name"] for r in cur.fetchall()]
+    return [r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _migrate_schema(db):
+    bcols = _table_columns(db, "branches")
+    if "allowed_ip" not in bcols:
+        db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
+        db.commit()
+    if "active" not in bcols:
+        db.execute("ALTER TABLE branches ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        db.commit()
+    db.execute("UPDATE branches SET active = 1 WHERE active IS NULL")
+    db.commit()
+
+    pcols = _table_columns(db, "personnel")
+    if "employee_code" not in pcols:
+        db.execute("ALTER TABLE personnel ADD COLUMN employee_code TEXT")
+        db.commit()
+    if "code_confirmed" not in pcols:
+        db.execute("ALTER TABLE personnel ADD COLUMN code_confirmed INTEGER NOT NULL DEFAULT 0")
+        db.commit()
+
+    acols = _table_columns(db, "attendance")
+    if "auto_closed" not in acols:
+        db.execute("ALTER TABLE attendance ADD COLUMN auto_closed INTEGER NOT NULL DEFAULT 0")
+        db.commit()
+    db.execute(
+        """
+        UPDATE attendance SET auto_closed = 1
+        WHERE source = 'auto' AND (auto_closed IS NULL OR auto_closed = 0)
+        """
+    )
+    db.commit()
+
+    # Yeni tablolar CREATE IF NOT EXISTS ile init_db'de; eski DB için de güvence:
+    if db.backend == "postgres":
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS personnel_leaves (
+                id SERIAL PRIMARY KEY,
+                personnel_id INTEGER NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                leave_type TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS branch_holidays (
+                id SERIAL PRIMARY KEY,
+                branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                title TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT
+            );
             """
         )
-        bcols = [r["column_name"] for r in cur.fetchall()]
-        if "allowed_ip" not in bcols:
-            db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
-            db.commit()
-        if "active" not in bcols:
-            db.execute("ALTER TABLE branches ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-            db.commit()
     else:
-        # SQLite: PRAGMA kullan
-        bcols = [r["name"] for r in db.execute("PRAGMA table_info(branches)").fetchall()]
-        if "allowed_ip" not in bcols:
-            db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
-            db.commit()
-            bcols.append("allowed_ip")
-        if "active" not in bcols:
-            db.execute("ALTER TABLE branches ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-            db.commit()
-    db.execute("UPDATE branches SET active = 1 WHERE active IS NULL")
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS personnel_leaves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                personnel_id INTEGER NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                leave_type TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (personnel_id) REFERENCES personnel(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS branch_holidays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                branch_id INTEGER NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                title TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT
+            );
+            """
+        )
+
+    # Benzersiz isimlere geçici kod önermesi YOK; sadece tekil isimlere otomatik kod.
+    # Aynı isimli kişiler manuel eşleştirme ekranında kod alır (otomatik varsayım yok).
+    people = db.execute(
+        "SELECT id, full_name, employee_code, code_confirmed FROM personnel ORDER BY id"
+    ).fetchall()
+    by_name: dict[str, list] = {}
+    for p in people:
+        key = (p["full_name"] or "").strip().casefold()
+        by_name.setdefault(key, []).append(p)
+    used = {
+        (p["employee_code"] or "").strip().upper()
+        for p in people
+        if (p["employee_code"] or "").strip()
+    }
+    next_n = 1
+    for key, group in by_name.items():
+        if len(group) != 1:
+            continue
+        p = group[0]
+        if (p["employee_code"] or "").strip():
+            if not int(p["code_confirmed"] or 0):
+                db.execute(
+                    "UPDATE personnel SET code_confirmed = 1 WHERE id = ?",
+                    (p["id"],),
+                )
+            continue
+        while f"P{next_n:04d}" in used:
+            next_n += 1
+        code = f"P{next_n:04d}"
+        used.add(code)
+        next_n += 1
+        db.execute(
+            "UPDATE personnel SET employee_code = ?, code_confirmed = 1 WHERE id = ?",
+            (code, p["id"]),
+        )
     db.commit()
 
 
 @app.before_request
 def before_request():
     init_db()
-    if request.endpoint != "static":
-        try:
-            auto_close_stale_checkouts(get_db())
-        except Exception:
-            app.logger.exception("auto_close_stale_checkouts")
+    ep = request.endpoint or ""
+    if ep == "static":
+        return None
+    # Admin oturum zaman aşımı
+    if session.get("is_admin") and ep not in ("index", "logout", "health"):
+        last = session.get("admin_last_active")
+        now_ts = time.time()
+        if last is not None and (now_ts - float(last)) > ADMIN_SESSION_IDLE_SEC:
+            session.clear()
+            flash("Oturum süresi doldu. Lütfen yeniden giriş yapın.", "warning")
+            return redirect(url_for("index", next=request.path))
+        session["admin_last_active"] = now_ts
+        session.modified = True
+    try:
+        auto_close_stale_checkouts(get_db())
+    except Exception:
+        app.logger.exception("auto_close_stale_checkouts")
+    return None
 
 
 def require_admin():
@@ -347,7 +556,7 @@ def auto_close_stale_checkouts(db):
         db.execute(
             """
             UPDATE attendance
-            SET checkout_at = ?, duration_minutes = ?, source = 'auto'
+            SET checkout_at = ?, duration_minutes = ?, source = 'auto', auto_closed = 1
             WHERE id = ? AND checkout_at IS NULL
             """,
             (checkout_s, duration, row["id"]),
@@ -374,16 +583,7 @@ def _minutes_between(start_dt, end_dt):
 
 
 def format_duration_tr(minutes: int | float | None) -> str:
-    if minutes is None:
-        minutes = 0
-    m = int(max(0, minutes))
-    h, mm = divmod(m, 60)
-    parts = []
-    if h:
-        parts.append(f"{h} sa")
-    if mm:
-        parts.append(f"{mm} dk")
-    return " ".join(parts) if parts else "0 dk"
+    return logic_format_duration_tr(minutes)
 
 
 def format_display_datetime(value) -> str:
@@ -465,14 +665,7 @@ def choice_lock_error_response(db, personnel_id: int, branch_id: int):
 
 
 def parse_hhmm(raw: str | None):
-    s = (raw or "").strip()
-    if len(s) < 4:
-        return None
-    try:
-        datetime.strptime(s, "%H:%M")
-    except ValueError:
-        return None
-    return s
+    return logic_parse_hhmm(raw)
 
 
 def get_client_ip():
@@ -588,21 +781,212 @@ def fetch_personnel_for_public():
         FROM personnel p
         JOIN branches b ON b.id = p.branch_id
         WHERE p.active = 1 AND b.active = 1
-        ORDER BY p.full_name
+        ORDER BY p.employee_code, p.full_name
         """
     ).fetchall()
 
 
 def fetch_personnel_admin():
     db = get_db()
+    if db.backend == "postgres":
+        return db.execute(
+            """
+            SELECT p.*, b.name AS branch_name
+            FROM personnel p
+            JOIN branches b ON b.id = p.branch_id
+            ORDER BY p.employee_code NULLS LAST, p.full_name
+            """
+        ).fetchall()
     return db.execute(
         """
         SELECT p.*, b.name AS branch_name
         FROM personnel p
         JOIN branches b ON b.id = p.branch_id
-        ORDER BY p.full_name
+        ORDER BY CASE WHEN p.employee_code IS NULL OR p.employee_code = '' THEN 1 ELSE 0 END,
+                 p.employee_code, p.full_name
         """
     ).fetchall()
+
+
+def person_label(row) -> str:
+    try:
+        code = row["employee_code"]
+    except (KeyError, TypeError, IndexError):
+        code = None
+    name = row["full_name"]
+    code = (str(code).strip() if code is not None else "")
+    return f"[{code}] {name}" if code else name
+
+
+def write_audit(db, action: str, detail: str = "", actor: str = "admin"):
+    db.execute(
+        "INSERT INTO audit_log (created_at, actor, action, detail) VALUES (?, ?, ?, ?)",
+        (now_str(), actor, action, detail or ""),
+    )
+    db.commit()
+
+
+def next_employee_code(db) -> str:
+    rows = db.execute("SELECT employee_code FROM personnel").fetchall()
+    return suggest_next_code([r["employee_code"] for r in rows])
+
+
+def personnel_needing_manual_codes(db):
+    """Aynı isimli veya kodu olmayan personeller (manuel eşleştirme gerekir)."""
+    people = fetch_personnel_admin()
+    dups = duplicate_name_groups(people)
+    dup_ids = {int(p["id"]) for g in dups for p in g}
+    missing = []
+    for p in people:
+        code = (p["employee_code"] or "").strip()
+        confirmed = int(p["code_confirmed"] or 0) == 1
+        if not code or (int(p["id"]) in dup_ids and not confirmed):
+            missing.append(p)
+    return missing, dups
+
+
+def is_leave_or_holiday(db, personnel_id: int, branch_id: int, day_s: str) -> bool:
+    pl = db.execute(
+        """
+        SELECT id FROM personnel_leaves
+        WHERE personnel_id = ? AND start_date <= ? AND end_date >= ?
+        LIMIT 1
+        """,
+        (personnel_id, day_s, day_s),
+    ).fetchone()
+    if pl:
+        return True
+    bh = db.execute(
+        """
+        SELECT id FROM branch_holidays
+        WHERE branch_id = ? AND start_date <= ? AND end_date >= ?
+        LIMIT 1
+        """,
+        (branch_id, day_s, day_s),
+    ).fetchone()
+    return bool(bh)
+
+
+def actual_work_minutes_on_day(db, personnel_id: int, day_s: str) -> int:
+    rows = db.execute(
+        """
+        SELECT date, checkin_at, checkout_at, duration_minutes, source, auto_closed
+        FROM attendance
+        WHERE personnel_id = ? AND date = ?
+        """,
+        (personnel_id, day_s),
+    ).fetchall()
+    now = now_tr()
+    today_s = now.strftime("%Y-%m-%d")
+    total = 0
+    for r in rows:
+        total += minutes_from_attendance_row(
+            r,
+            today_s=today_s,
+            now=now,
+            parse_ts_tr=_parse_ts_tr,
+            minutes_between=_minutes_between,
+        )
+    return total
+
+
+def count_leave_days_in_range(db, personnel_id: int, branch_id: int, start_d, end_d) -> int:
+    n = 0
+    for d in iter_dates(start_d, end_d):
+        if is_leave_or_holiday(db, personnel_id, branch_id, d.strftime("%Y-%m-%d")):
+            n += 1
+    return n
+
+
+def personnel_missing_stats(db, personnel_id: int, start_d, end_d):
+    """Dönemsel eksik süre + izin günü sayısı + (ikincil) fiili çalışma."""
+    prow = db.execute(
+        """
+        SELECT p.*, b.shift_start, b.shift_end, b.name AS branch_name
+        FROM personnel p
+        JOIN branches b ON b.id = p.branch_id
+        WHERE p.id = ?
+        """,
+        (personnel_id,),
+    ).fetchone()
+    if not prow:
+        return None
+
+    missing_total = 0
+    worked_total = 0
+    leave_days = 0
+    counted_days = 0
+    auto_closed_days = 0
+
+    for d in iter_dates(start_d, end_d):
+        day_s = d.strftime("%Y-%m-%d")
+        if is_leave_or_holiday(db, personnel_id, int(prow["branch_id"]), day_s):
+            leave_days += 1
+            continue
+        actual = actual_work_minutes_on_day(db, personnel_id, day_s)
+        # Otomatik kapanmış kayıtları olan günlerde fiili süre 0 sayılır (yukarıda)
+        ac = db.execute(
+            """
+            SELECT COUNT(*) AS c FROM attendance
+            WHERE personnel_id = ? AND date = ? AND auto_closed = 1
+            """,
+            (personnel_id, day_s),
+        ).fetchone()
+        if ac and int(ac["c"] or 0) > 0 and actual == 0:
+            auto_closed_days += 1
+        miss = missing_minutes_for_day(
+            day_s=day_s,
+            shift_start=prow["shift_start"],
+            shift_end=prow["shift_end"],
+            is_leave=False,
+            actual_minutes=actual,
+        )
+        if miss is None:
+            continue
+        missing_total += miss
+        worked_total += actual
+        counted_days += 1
+
+    return {
+        "personnel_id": personnel_id,
+        "full_name": prow["full_name"],
+        "employee_code": prow["employee_code"] or "",
+        "branch_id": int(prow["branch_id"]),
+        "branch_name": prow["branch_name"],
+        "label": person_label(prow),
+        "missing_minutes": missing_total,
+        "missing_hm": format_duration_tr(missing_total),
+        "worked_minutes": worked_total,
+        "worked_hm": format_duration_tr(worked_total),
+        "leave_days": leave_days,
+        "counted_days": counted_days,
+        "auto_closed_days": auto_closed_days,
+        "shift_hm": format_duration_tr(
+            shift_length_minutes(prow["shift_start"], prow["shift_end"])
+        ),
+    }
+
+
+def period_missing_report(db, start_d, end_d, branch_id=None):
+    q = """
+        SELECT p.*, b.name AS branch_name, b.shift_start, b.shift_end
+        FROM personnel p
+        JOIN branches b ON b.id = p.branch_id
+        WHERE p.active = 1
+    """
+    params: list = []
+    if branch_id:
+        q += " AND p.branch_id = ?"
+        params.append(branch_id)
+    q += " ORDER BY p.employee_code, p.full_name"
+    people = db.execute(q, tuple(params)).fetchall()
+    rows = []
+    for p in people:
+        st = personnel_missing_stats(db, int(p["id"]), start_d, end_d)
+        if st:
+            rows.append(st)
+    rows.sort(key=lambda r: (-r["missing_minutes"], r["label"].lower()))
+    return rows
 
 
 def branch_shift_moment_on_day_tr(day_str: str, hhmm: str | None, default_hhmm: str) -> datetime | None:
@@ -614,25 +998,30 @@ def branch_shift_moment_on_day_tr(day_str: str, hhmm: str | None, default_hhmm: 
 
 
 def fetch_today_dashboard_summary(db):
-    """Bugün (TR): içeridekiler, mesai başına geç gelenler, mesai bitimini geçirip hâlâ içeride olanlar."""
+    """Bugün: içeridekiler + eksik saat odaklı özet (geç kalma eksik süreye dahildir)."""
     now = now_tr()
     today_s = now.strftime("%Y-%m-%d")
+    today_d = now.date()
 
     inside_rows = db.execute(
         """
-        SELECT p.full_name, b.name AS branch_name, a.checkin_at, b.shift_end
+        SELECT p.id AS personnel_id, p.full_name, p.employee_code, b.name AS branch_name,
+               a.checkin_at, b.shift_end
         FROM attendance a
         JOIN personnel p ON p.id = a.personnel_id
         JOIN branches b ON b.id = a.branch_id
         WHERE a.date = ? AND a.checkout_at IS NULL AND a.checkin_at IS NOT NULL
-        ORDER BY LOWER(p.full_name), p.full_name
+        ORDER BY p.employee_code, p.full_name
         """,
         (today_s,),
     ).fetchall()
 
     inside = [
         {
+            "personnel_id": r["personnel_id"],
             "full_name": r["full_name"],
+            "employee_code": r["employee_code"] or "",
+            "label": person_label(r),
             "branch_name": r["branch_name"],
             "checkin_label": format_display_datetime(r["checkin_at"]),
         }
@@ -645,156 +1034,81 @@ def fetch_today_dashboard_summary(db):
         if end_m and now > end_m:
             past_shift_inside.append(
                 {
-                    "full_name": r["full_name"],
+                    "label": person_label(r),
                     "branch_name": r["branch_name"],
                     "checkin_label": format_display_datetime(r["checkin_at"]),
                 }
             )
 
-    cin_rows = db.execute(
-        """
-        SELECT p.id AS personnel_id, p.full_name, b.name AS branch_name, b.shift_start, a.checkin_at, a.id
-        FROM attendance a
-        JOIN personnel p ON p.id = a.personnel_id
-        JOIN branches b ON b.id = a.branch_id
-        WHERE a.date = ? AND a.checkin_at IS NOT NULL
-        ORDER BY p.id, a.id
-        """,
-        (today_s,),
-    ).fetchall()
-
-    late_arrivals = []
-    seen_pid = set()
-    for r in cin_rows:
-        pid = r["personnel_id"]
-        if pid in seen_pid:
+    # Bugün eksik süresi > 0 olan personeller (izinli değil)
+    missing_today = []
+    for p in fetch_personnel_admin():
+        if not int(p["active"] or 0):
             continue
-        seen_pid.add(pid)
-        st = branch_shift_moment_on_day_tr(today_s, r["shift_start"], "09:00")
-        ci = _parse_ts_tr(r["checkin_at"])
-        if st and ci and ci > st:
-            late_min = _minutes_between(st, ci)
-            late_arrivals.append(
-                {
-                    "full_name": r["full_name"],
-                    "branch_name": r["branch_name"],
-                    "checkin_label": format_display_datetime(r["checkin_at"]),
-                    "late_minutes": late_min,
-                    "late_hm": format_duration_tr(late_min),
-                }
-            )
+        st = personnel_missing_stats(db, int(p["id"]), today_d, today_d)
+        if not st or st["leave_days"]:
+            continue
+        if st["missing_minutes"] > 0:
+            missing_today.append(st)
+    missing_today.sort(key=lambda x: -x["missing_minutes"])
 
     return {
         "date_label": format_iso_date_tr(today_s),
         "inside": inside,
         "inside_count": len(inside),
-        "late_arrivals": late_arrivals,
+        "missing_today": missing_today,
         "past_shift_inside": past_shift_inside,
     }
 
 
 def personnel_work_stats(db, personnel_id: int):
-    rows = db.execute(
-        """
-        SELECT date, checkin_at, checkout_at, duration_minutes
-        FROM attendance WHERE personnel_id = ? ORDER BY id
-        """,
-        (personnel_id,),
-    ).fetchall()
-
     now = now_tr()
-
-    today_s = now.strftime("%Y-%m-%d")
+    today_d = now.date()
     mon_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).date()
-    week_start_date = now.date() - timedelta(days=(now.weekday()))
-    week_end_date = week_start_date + timedelta(days=6)
+    week_start = today_d - timedelta(days=today_d.weekday())
+    week_end = week_start + timedelta(days=6)
 
-    def contrib_minutes_day(iso_day: str):
-        total = 0
-        for r in rows:
-            if r["date"] != iso_day:
-                continue
-            if r["checkout_at"]:
-                total += int(r["duration_minutes"] or 0)
-            elif r["checkin_at"]:
-                ci = _parse_ts_tr(r["checkin_at"])
-                if ci:
-                    total += _minutes_between(ci, now)
-        return total
+    today_st = personnel_missing_stats(db, personnel_id, today_d, today_d)
+    week_st = personnel_missing_stats(db, personnel_id, week_start, week_end)
+    month_st = personnel_missing_stats(db, personnel_id, mon_start, today_d)
 
-    today_minutes = contrib_minutes_day(today_s)
+    def pack(st):
+        if not st:
+            return {
+                "missing_hm": "—",
+                "worked_hm": "—",
+                "leave_days": 0,
+                "missing_minutes": 0,
+            }
+        return st
 
-    weekly_minutes = 0
-    weekly_days = set()
-    cur = week_start_date
-    while cur <= week_end_date:
-        iso = cur.strftime("%Y-%m-%d")
-        m = contrib_minutes_day(iso)
-        if m > 0:
-            weekly_minutes += m
-            weekly_days.add(iso)
-        cur += timedelta(days=1)
-
-    monthly_minutes = 0
-    monthly_days = set()
-    cur = mon_start
-    while cur.year == now.year and cur.month == now.month and cur <= now.date():
-        iso = cur.strftime("%Y-%m-%d")
-        m = contrib_minutes_day(iso)
-        if m > 0:
-            monthly_minutes += m
-            monthly_days.add(iso)
-        cur += timedelta(days=1)
-
-    def fmt_h(m):
-        return round(m / 60.0, 2)
-
+    t, w, m = pack(today_st), pack(week_st), pack(month_st)
     return {
-        "today_hours": fmt_h(today_minutes),
-        "today_hm": format_duration_tr(today_minutes),
-        "week_days": len(weekly_days),
-        "week_hours": fmt_h(weekly_minutes),
-        "week_hm": format_duration_tr(weekly_minutes),
-        "month_days": len(monthly_days),
-        "month_hours": fmt_h(monthly_minutes),
-        "month_hm": format_duration_tr(monthly_minutes),
+        "today_missing_hm": t["missing_hm"] if t.get("leave_days") == 0 else "İzinli",
+        "today_worked_hm": t.get("worked_hm", "—"),
+        "today_leave": bool(t.get("leave_days")),
+        "week_missing_hm": w["missing_hm"],
+        "week_worked_hm": w.get("worked_hm", "—"),
+        "week_leave_days": w.get("leave_days", 0),
+        "month_missing_hm": m["missing_hm"],
+        "month_worked_hm": m.get("worked_hm", "—"),
+        "month_leave_days": m.get("leave_days", 0),
+        "leave_days_month": m.get("leave_days", 0),
     }
 
 
 def personnel_work_stats_range(db, personnel_id: int, start_date, end_date):
-    rows = db.execute(
-        """
-        SELECT date, checkin_at, checkout_at, duration_minutes
-        FROM attendance
-        WHERE personnel_id = ? AND date >= ? AND date <= ?
-        ORDER BY id
-        """,
-        (personnel_id, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
-    ).fetchall()
-
-    now = now_tr()
-    today_s = now.strftime("%Y-%m-%d")
-    total_minutes = 0
-    worked_days = set()
-
-    for row in rows:
-        minutes = 0
-        if row["checkout_at"]:
-            minutes = int(row["duration_minutes"] or 0)
-        elif row["checkin_at"] and row["date"] == today_s:
-            ci = _parse_ts_tr(row["checkin_at"])
-            if ci:
-                minutes = _minutes_between(ci, now)
-        if minutes > 0:
-            total_minutes += minutes
-            worked_days.add(row["date"])
-
+    st = personnel_missing_stats(db, personnel_id, start_date, end_date)
+    if not st:
+        return None
     return {
-        "range_days": len(worked_days),
-        "range_hours": round(total_minutes / 60.0, 2),
-        "range_hm": format_duration_tr(total_minutes),
+        "range_missing_hm": st["missing_hm"],
+        "range_worked_hm": st["worked_hm"],
+        "range_leave_days": st["leave_days"],
+        "range_days": st["counted_days"],
         "start_label": format_iso_date_tr(start_date.strftime("%Y-%m-%d")),
         "end_label": format_iso_date_tr(end_date.strftime("%Y-%m-%d")),
+        "auto_closed_days": st["auto_closed_days"],
     }
 
 
@@ -814,19 +1128,22 @@ def index():
         if mode == "setup" and action == "setup_password":
             password = request.form.get("password", "").strip()
             confirm_password = request.form.get("confirm_password", "").strip()
-            if len(password) < 4:
-                flash("Şifre en az 4 karakter olmalı.", "danger")
+            if len(password) < MIN_PASSWORD_LEN:
+                flash(f"Şifre en az {MIN_PASSWORD_LEN} karakter olmalı.", "danger")
             elif password != confirm_password:
                 flash("Şifre ile tekrar eşleşmiyor.", "danger")
             else:
                 set_setting("admin_password_hash", hash_password(password))
                 session["is_admin"] = True
+                session["admin_last_active"] = time.time()
+                write_audit(get_db(), "admin_password_setup", "İlk şifre belirlendi")
                 return redirect_after_admin_login(next_url)
 
         if mode == "login" and action == "login":
             password = request.form.get("password", "").strip()
             if verify_password(password):
                 session["is_admin"] = True
+                session["admin_last_active"] = time.time()
                 return redirect_after_admin_login(next_url)
             flash("Yönetici şifresi hatalı.", "danger")
 
@@ -865,16 +1182,20 @@ def admin():
                         (name, allowed_ip, now_str()),
                     )
                     db.commit()
+                    write_audit(db, "add_branch", f"Mağaza: {name}")
                     flash("Mağaza eklendi.", "success")
                 except (sqlite3.IntegrityError, PgIntegrityError):
                     flash("Bu isimde mağaza zaten var.", "danger")
 
         elif action == "delete_branch":
             bid = int(request.form["branch_id"])
+            db.execute("DELETE FROM branch_holidays WHERE branch_id = ?", (bid,))
             db.execute("DELETE FROM attendance WHERE branch_id = ?", (bid,))
+            db.execute("DELETE FROM personnel_leaves WHERE personnel_id IN (SELECT id FROM personnel WHERE branch_id = ?)", (bid,))
             db.execute("DELETE FROM personnel WHERE branch_id = ?", (bid,))
             db.execute("DELETE FROM branches WHERE id = ?", (bid,))
             db.commit()
+            write_audit(db, "delete_branch", f"branch_id={bid}")
             flash("Mağaza ve bağlı kayıtlar silindi.", "success")
 
         elif action == "set_branch_ip":
@@ -885,28 +1206,36 @@ def admin():
             else:
                 db.execute("UPDATE branches SET allowed_ip = ? WHERE id = ?", (raw, bid))
                 db.commit()
+                write_audit(db, "set_branch_ip", f"branch_id={bid} ip={raw}")
                 flash("Mağaza IP güncellendi.", "success")
 
         elif action == "add_personnel":
-            db.execute(
-                """
-                INSERT INTO personnel (full_name, branch_id, monthly_salary, active, created_at)
-                VALUES (?, ?, 0, 1, ?)
-                """,
-                (
-                    request.form["full_name"].strip(),
-                    int(request.form["branch_id"]),
-                    now_str(),
-                ),
-            )
-            db.commit()
-            flash("Personel eklendi.", "success")
+            full_name = request.form["full_name"].strip()
+            branch_id = int(request.form["branch_id"])
+            code = (request.form.get("employee_code") or "").strip().upper()
+            if not code:
+                code = next_employee_code(db)
+            try:
+                db.execute(
+                    """
+                    INSERT INTO personnel (full_name, employee_code, code_confirmed, branch_id, monthly_salary, active, created_at)
+                    VALUES (?, ?, 1, ?, 0, 1, ?)
+                    """,
+                    (full_name, code, branch_id, now_str()),
+                )
+                db.commit()
+                write_audit(db, "add_personnel", f"{code} {full_name} branch={branch_id}")
+                flash(f"Personel eklendi. Kod: {code}", "success")
+            except (sqlite3.IntegrityError, PgIntegrityError):
+                flash("Bu personel kodu zaten kullanılıyor. Farklı bir kod girin.", "danger")
 
         elif action == "delete_personnel":
             pid = int(request.form["personnel_id"])
+            db.execute("DELETE FROM personnel_leaves WHERE personnel_id = ?", (pid,))
             db.execute("DELETE FROM attendance WHERE personnel_id = ?", (pid,))
             db.execute("DELETE FROM personnel WHERE id = ?", (pid,))
             db.commit()
+            write_audit(db, "delete_personnel", f"personnel_id={pid}")
             flash("Personel ve mesai kayıtları silindi.", "success")
             return_pid = request.form.get("return_pid", type=int)
             if return_pid == pid:
@@ -916,6 +1245,7 @@ def admin():
             pid = int(request.form["personnel_id"])
             db.execute("DELETE FROM device_bindings WHERE personnel_id = ?", (pid,))
             db.commit()
+            write_audit(db, "reset_device", f"personnel_id={pid}")
             flash("Cihaz eşleştirmesi sıfırlandı. Personel ilk girişte yeniden seçim yapacak.", "success")
 
         elif action == "add_note":
@@ -926,12 +1256,14 @@ def admin():
                     (content, now_str()),
                 )
                 db.commit()
+                write_audit(db, "add_note", content[:120])
                 flash("Duyuru kaydedildi.", "success")
 
         elif action == "delete_note":
             note_id = int(request.form["announcement_id"])
             db.execute("DELETE FROM announcements WHERE id = ?", (note_id,))
             db.commit()
+            write_audit(db, "delete_note", f"id={note_id}")
             flash("Duyuru silindi.", "success")
 
         elif action == "change_admin_password":
@@ -939,25 +1271,169 @@ def admin():
             new_password = request.form.get("new_password", "").strip()
             if not verify_password(current_password):
                 flash("Mevcut şifre hatalı.", "danger")
-            elif len(new_password) < 4:
-                flash("Yeni şifre en az 4 karakter olmalı.", "danger")
+            elif len(new_password) < MIN_PASSWORD_LEN:
+                flash(f"Yeni şifre en az {MIN_PASSWORD_LEN} karakter olmalı.", "danger")
             else:
                 set_setting("admin_password_hash", hash_password(new_password))
+                write_audit(db, "change_admin_password", "Şifre güncellendi")
                 flash("Yönetici şifresi güncellendi.", "success")
 
         elif action == "set_branch_hours":
             bid = int(request.form["branch_id"])
             ss = parse_hhmm(request.form.get("shift_start"))
             se = parse_hhmm(request.form.get("shift_end"))
+            allowed_ip = request.form.get("allowed_ip", "").strip()
             if not ss or not se:
                 flash("Giriş/çıkış saati HH:MM formatında olmalı (ör. 09:00).", "danger")
             else:
+                if allowed_ip:
+                    db.execute(
+                        "UPDATE branches SET shift_start = ?, shift_end = ?, allowed_ip = ? WHERE id = ?",
+                        (ss, se, allowed_ip, bid),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE branches SET shift_start = ?, shift_end = ? WHERE id = ?",
+                        (ss, se, bid),
+                    )
+                db.commit()
+                write_audit(db, "set_branch_hours", f"branch_id={bid} {ss}-{se}")
+                flash("Mağaza mesai/IP güncellendi.", "success")
+
+        elif action == "assign_personnel_code":
+            pid = int(request.form["personnel_id"])
+            code = (request.form.get("employee_code") or "").strip().upper()
+            full_name = (request.form.get("full_name") or "").strip()
+            if not code:
+                flash("Personel kodu zorunlu.", "danger")
+            else:
+                try:
+                    if full_name:
+                        db.execute(
+                            """
+                            UPDATE personnel
+                            SET employee_code = ?, code_confirmed = 1, full_name = ?
+                            WHERE id = ?
+                            """,
+                            (code, full_name, pid),
+                        )
+                    else:
+                        db.execute(
+                            """
+                            UPDATE personnel SET employee_code = ?, code_confirmed = 1 WHERE id = ?
+                            """,
+                            (code, pid),
+                        )
+                    db.commit()
+                    write_audit(db, "assign_personnel_code", f"id={pid} code={code}")
+                    flash(f"Kod kaydedildi: {code}", "success")
+                except (sqlite3.IntegrityError, PgIntegrityError):
+                    flash("Bu kod başka bir personele ait.", "danger")
+            return redirect(url_for("admin_personnel_codes"))
+
+        elif action == "add_leave":
+            pid = int(request.form["personnel_id"])
+            start_d = parse_iso_date(request.form.get("start_date"))
+            end_d = parse_iso_date(request.form.get("end_date")) or start_d
+            leave_type = (request.form.get("leave_type") or "mazeret").strip()
+            note = (request.form.get("note") or "").strip()
+            if not start_d or not end_d or end_d < start_d:
+                flash("İzin tarihleri geçersiz.", "danger")
+            elif leave_type not in LEAVE_TYPE_LABELS:
+                flash("İzin türü geçersiz.", "danger")
+            else:
                 db.execute(
-                    "UPDATE branches SET shift_start = ?, shift_end = ? WHERE id = ?",
-                    (ss, se, bid),
+                    """
+                    INSERT INTO personnel_leaves (personnel_id, start_date, end_date, leave_type, note, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pid,
+                        start_d.strftime("%Y-%m-%d"),
+                        end_d.strftime("%Y-%m-%d"),
+                        leave_type,
+                        note,
+                        now_str(),
+                    ),
                 )
                 db.commit()
-                flash("Mağaza mesai saatleri güncellendi.", "success")
+                write_audit(db, "add_leave", f"pid={pid} {start_d}..{end_d} {leave_type}")
+                flash("İzin/tatil kaydı eklendi.", "success")
+
+        elif action == "delete_leave":
+            lid = int(request.form["leave_id"])
+            db.execute("DELETE FROM personnel_leaves WHERE id = ?", (lid,))
+            db.commit()
+            write_audit(db, "delete_leave", f"id={lid}")
+            flash("İzin kaydı silindi.", "success")
+
+        elif action == "add_branch_holiday":
+            bid = int(request.form["branch_id"])
+            start_d = parse_iso_date(request.form.get("start_date"))
+            end_d = parse_iso_date(request.form.get("end_date")) or start_d
+            title = (request.form.get("title") or "Resmi tatil").strip()
+            if not start_d or not end_d or end_d < start_d:
+                flash("Tatil tarihleri geçersiz.", "danger")
+            else:
+                db.execute(
+                    """
+                    INSERT INTO branch_holidays (branch_id, start_date, end_date, title, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        bid,
+                        start_d.strftime("%Y-%m-%d"),
+                        end_d.strftime("%Y-%m-%d"),
+                        title,
+                        now_str(),
+                    ),
+                )
+                db.commit()
+                write_audit(db, "add_branch_holiday", f"branch={bid} {title}")
+                flash("Mağaza tatili eklendi (tüm personel için hesap dışı).", "success")
+
+        elif action == "delete_branch_holiday":
+            hid = int(request.form["holiday_id"])
+            db.execute("DELETE FROM branch_holidays WHERE id = ?", (hid,))
+            db.commit()
+            write_audit(db, "delete_branch_holiday", f"id={hid}")
+            flash("Mağaza tatili silindi.", "success")
+
+        elif action == "correct_attendance":
+            aid = int(request.form["attendance_id"])
+            checkout_raw = (request.form.get("checkout_at") or "").strip()
+            clear_auto = request.form.get("clear_auto_closed") == "1"
+            row = db.execute("SELECT * FROM attendance WHERE id = ?", (aid,)).fetchone()
+            if not row:
+                flash("Kayıt bulunamadı.", "danger")
+            else:
+                ci = _parse_ts_tr(row["checkin_at"])
+                co = _parse_ts_tr(checkout_raw) if checkout_raw else None
+                if checkout_raw and not co:
+                    flash("Çıkış saati YYYY-MM-DD HH:MM:SS formatında olmalı.", "danger")
+                elif co and ci and co < ci:
+                    flash("Çıkış, girişten önce olamaz.", "danger")
+                else:
+                    duration = _minutes_between(ci, co) if ci and co else int(row["duration_minutes"] or 0)
+                    auto_closed = 0 if clear_auto or co else int(row["auto_closed"] or 0)
+                    new_source = "mobile" if auto_closed == 0 else (row["source"] or "mobile")
+                    db.execute(
+                        """
+                        UPDATE attendance
+                        SET checkout_at = ?, duration_minutes = ?, auto_closed = ?, source = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            checkout_raw or row["checkout_at"],
+                            duration,
+                            auto_closed,
+                            new_source,
+                            aid,
+                        ),
+                    )
+                    db.commit()
+                    write_audit(db, "correct_attendance", f"id={aid} auto={auto_closed}")
+                    flash("Mesai kaydı düzeltildi; artık eksik saat hesabına dahil edilebilir.", "success")
 
         return_pid = request.form.get("return_pid", type=int)
         if return_pid:
@@ -966,17 +1442,45 @@ def admin():
 
     branches = fetch_branches(active_only=False)
     personnel_admin = fetch_personnel_admin()
+    needing_codes, dup_groups = personnel_needing_manual_codes(db)
 
-    attendance_rows = db.execute(
-        """
-        SELECT a.*, p.full_name, b.name AS branch_name
+    q_filter = (request.args.get("q") or "").strip().casefold()
+    branch_filter = request.args.get("branch_filter", type=int)
+    page = max(1, request.args.get("page", default=1, type=int))
+    per_page = 40
+
+    attendance_q = """
+        SELECT a.*, p.full_name, p.employee_code, b.name AS branch_name
         FROM attendance a
         JOIN personnel p ON p.id = a.personnel_id
         JOIN branches b ON b.id = a.branch_id
-        ORDER BY COALESCE(a.checkout_at, a.checkin_at) DESC, a.id DESC
-        LIMIT 200
-        """
-    ).fetchall()
+        WHERE 1=1
+    """
+    params: list = []
+    if branch_filter:
+        attendance_q += " AND a.branch_id = ?"
+        params.append(branch_filter)
+    if q_filter:
+        attendance_q += " AND (LOWER(p.full_name) LIKE ? OR LOWER(COALESCE(p.employee_code,'')) LIKE ? OR LOWER(b.name) LIKE ?)"
+        like = f"%{q_filter}%"
+        params.extend([like, like, like])
+    attendance_q += " ORDER BY COALESCE(a.checkout_at, a.checkin_at) DESC, a.id DESC"
+
+    all_att = db.execute(attendance_q, tuple(params)).fetchall()
+    total_att = len(all_att)
+    total_pages = max(1, (total_att + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    attendance_rows = all_att[(page - 1) * per_page : page * per_page]
+
+    personnel_filtered = personnel_admin
+    if q_filter:
+        personnel_filtered = [
+            p
+            for p in personnel_admin
+            if q_filter in (p["full_name"] or "").casefold()
+            or q_filter in (p["employee_code"] or "").casefold()
+            or q_filter in (p["branch_name"] or "").casefold()
+        ]
 
     latest_notes = db.execute(
         "SELECT id, content, created_at FROM announcements ORDER BY id DESC LIMIT 20"
@@ -990,14 +1494,24 @@ def admin():
     sel_stats = None
     sel_range_stats = None
     sel_name = None
+    sel_code = None
+    sel_leaves = []
     if selected_pid:
         prow = db.execute(
-            "SELECT full_name FROM personnel WHERE id = ?",
+            "SELECT full_name, employee_code FROM personnel WHERE id = ?",
             (selected_pid,),
         ).fetchone()
         if prow:
             sel_name = prow["full_name"]
+            sel_code = prow["employee_code"] or ""
             sel_stats = personnel_work_stats(db, selected_pid)
+            sel_leaves = db.execute(
+                """
+                SELECT * FROM personnel_leaves
+                WHERE personnel_id = ? ORDER BY start_date DESC LIMIT 50
+                """,
+                (selected_pid,),
+            ).fetchall()
             start_date = parse_iso_date(selected_start)
             end_date = parse_iso_date(selected_end)
             if selected_start and selected_end:
@@ -1006,27 +1520,149 @@ def admin():
                 elif start_date > end_date:
                     flash("Başlangıç tarihi, bitişten büyük olamaz.", "warning")
                 else:
-                    sel_range_stats = personnel_work_stats_range(db, selected_pid, start_date, end_date)
+                    sel_range_stats = personnel_work_stats_range(
+                        db, selected_pid, start_date, end_date
+                    )
+
+    holidays = db.execute(
+        """
+        SELECT h.*, b.name AS branch_name
+        FROM branch_holidays h
+        JOIN branches b ON b.id = h.branch_id
+        ORDER BY h.start_date DESC LIMIT 40
+        """
+    ).fetchall()
+
+    audit_rows = db.execute(
+        "SELECT * FROM audit_log ORDER BY id DESC LIMIT 40"
+    ).fetchall()
 
     return render_template(
         "admin.html",
         branches=branches,
-        personnel=personnel_admin,
+        personnel=personnel_filtered,
         attendance_rows=attendance_rows,
         latest_notes=latest_notes,
         today_summary=today_summary,
         selected_pid=selected_pid,
         sel_name=sel_name,
+        sel_code=sel_code,
         sel_stats=sel_stats,
         sel_range_stats=sel_range_stats,
         selected_start=selected_start,
         selected_end=selected_end,
+        sel_leaves=sel_leaves,
+        leave_types=LEAVE_TYPES,
+        leave_type_labels=LEAVE_TYPE_LABELS,
+        holidays=holidays,
+        audit_rows=audit_rows,
+        needing_codes=needing_codes,
+        dup_groups=dup_groups,
+        suggested_code=next_employee_code(db),
+        q=request.args.get("q") or "",
+        branch_filter=branch_filter,
+        page=page,
+        total_pages=total_pages,
+        total_att=total_att,
+        min_password_len=MIN_PASSWORD_LEN,
     )
 
 
 @app.get("/admin/gun-sonu")
 def gun_sonu_legacy_redirect():
     return redirect(url_for("admin"))
+
+
+@app.route("/admin/personel-kodlari", methods=["GET", "POST"])
+def admin_personnel_codes():
+    if not require_admin():
+        return redirect(url_for("index", next=request.path))
+    db = get_db()
+    if request.method == "POST":
+        # handled via admin assign_personnel_code redirect target
+        pass
+    needing, dups = personnel_needing_manual_codes(db)
+    all_p = fetch_personnel_admin()
+    return render_template(
+        "personnel_codes.html",
+        needing_codes=needing,
+        dup_groups=dups,
+        personnel=all_p,
+        suggested_code=next_employee_code(db),
+    )
+
+
+@app.route("/admin/eksik-saat", methods=["GET"])
+def admin_missing_hours():
+    if not require_admin():
+        return redirect(url_for("index", next=request.path))
+    db = get_db()
+    start_s = (request.args.get("start") or "").strip()
+    end_s = (request.args.get("end") or "").strip()
+    branch_id = request.args.get("branch_id", type=int)
+    now = now_tr().date()
+    start_d = parse_iso_date(start_s) or now.replace(day=1)
+    end_d = parse_iso_date(end_s) or now
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+    rows = period_missing_report(db, start_d, end_d, branch_id=branch_id)
+    return render_template(
+        "eksik_saat.html",
+        rows=rows,
+        start=start_d.strftime("%Y-%m-%d"),
+        end=end_d.strftime("%Y-%m-%d"),
+        branch_id=branch_id,
+        branches=fetch_branches(active_only=False),
+    )
+
+
+@app.get("/rapor/eksik-saat.csv")
+def export_missing_hours_csv():
+    if not require_admin():
+        return redirect(url_for("index"))
+    db = get_db()
+    start_d = parse_iso_date(request.args.get("start")) or now_tr().date().replace(day=1)
+    end_d = parse_iso_date(request.args.get("end")) or now_tr().date()
+    branch_id = request.args.get("branch_id", type=int)
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+    rows = period_missing_report(db, start_d, end_d, branch_id=branch_id)
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "PersonelKodu",
+            "İsim",
+            "Mağaza",
+            "EksikSüre",
+            "EksikDakika",
+            "FiiliÇalışma",
+            "İzinGünü",
+            "HesaplananGün",
+            "OtomatikKapalıGün",
+            "Başlangıç",
+            "Bitiş",
+        ]
+    )
+    for r in rows:
+        writer.writerow(
+            [
+                r["employee_code"],
+                r["full_name"],
+                r["branch_name"],
+                r["missing_hm"],
+                r["missing_minutes"],
+                r["worked_hm"],
+                r["leave_days"],
+                r["counted_days"],
+                r["auto_closed_days"],
+                start_d.strftime("%Y-%m-%d"),
+                end_d.strftime("%Y-%m-%d"),
+            ]
+        )
+    resp = Response("\ufeff" + output.getvalue(), mimetype="text/csv; charset=utf-8")
+    resp.headers["Content-Disposition"] = "attachment; filename=pdks_eksik_saat.csv"
+    return resp
 
 
 @app.route("/personel")
@@ -1289,7 +1925,7 @@ def api_punch():
         db.execute(
             """
             UPDATE attendance
-            SET checkout_at = ?, duration_minutes = ?
+            SET checkout_at = ?, duration_minutes = ?, auto_closed = 0, source = 'mobile'
             WHERE id = ?
             """,
             (now_str(), duration, open_record["id"]),
@@ -1310,9 +1946,9 @@ def export_excel():
     db = get_db()
     rows = db.execute(
         """
-        SELECT p.full_name AS isim, b.name AS sube, a.date AS tarih,
+        SELECT p.employee_code AS kod, p.full_name AS isim, b.name AS sube, a.date AS tarih,
             COALESCE(a.checkin_at, '-') AS giris, COALESCE(a.checkout_at, '-') AS cikis,
-            a.duration_minutes AS dk
+            a.duration_minutes AS dk, a.auto_closed AS auto_closed, a.source AS source
         FROM attendance a
         JOIN personnel p ON p.id = a.personnel_id
         JOIN branches b ON b.id = a.branch_id
@@ -1322,16 +1958,19 @@ def export_excel():
 
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["İsim", "Mağaza", "Tarih", "Giriş", "Çıkış", "Süre"])
+    writer.writerow(["Kod", "İsim", "Mağaza", "Tarih", "Giriş", "Çıkış", "Süre", "OtomatikKapatıldı"])
     for row in rows:
+        auto = "Evet" if int(row["auto_closed"] or 0) == 1 or row["source"] == "auto" else "Hayır"
         writer.writerow(
             [
+                row["kod"] or "",
                 row["isim"],
                 row["sube"],
                 format_iso_date_tr(row["tarih"]),
                 format_display_datetime(row["giris"]) if row["giris"] not in ("-", None) else "—",
                 format_display_datetime(row["cikis"]) if row["cikis"] not in ("-", None) else "—",
                 format_duration_tr(row["dk"]),
+                auto,
             ]
         )
     resp = Response(output.getvalue(), mimetype="application/vnd.ms-excel")

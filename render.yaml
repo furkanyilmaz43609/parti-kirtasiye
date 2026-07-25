@@ -1,11 +1,10 @@
-# ÜCRETSİZ kalıcılık (önerilen):
-# - SQLite yerine harici Postgres kullanın (Supabase/Neon Free).
-# - Render Environment'a DATABASE_URL verin.
+# Kalıcılık: DATABASE_URL ile harici Postgres (Neon/Supabase).
+# Uyku ekranı olmaması için plan: starter (Render panelden de yükseltin).
 services:
   - type: web
     name: parti-kirtasiye-pdks
     runtime: python
-    plan: free
+    plan: starter
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
