@@ -62,8 +62,16 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "pdks-local-dev-change-me")
 
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+if DATABASE_URL:
+    # Neon bazen channel_binding=require ekler; psycopg2 ile sorun çıkarabilir
+    DATABASE_URL = (
+        DATABASE_URL.replace("&channel_binding=require", "")
+        .replace("?channel_binding=require&", "?")
+        .replace("?channel_binding=require", "")
+    )
 DATABASE = os.path.abspath(os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "pdks_merkez.db")))
 
+_SCHEMA_READY = False
 _RENDER_HOSTED = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
 if _RENDER_HOSTED:
     from werkzeug.middleware.proxy_fix import ProxyFix
@@ -95,21 +103,35 @@ class DB:
     def commit(self):
         self.conn.commit()
 
+    def rollback(self):
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+
     def execute(self, query: str, params=()):
         if self.backend == "sqlite":
             return self.conn.execute(query, params)
         q = query.replace("?", "%s")
         cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(q, params)
+        try:
+            cur.execute(q, params)
+        except Exception:
+            self.conn.rollback()
+            raise
         return cur
 
     def executescript(self, script: str):
         if self.backend == "sqlite":
             return self.conn.executescript(script)
         cur = self.conn.cursor()
-        for stmt in [s.strip() for s in script.split(";") if s.strip()]:
-            cur.execute(stmt)
-        self.conn.commit()
+        try:
+            for stmt in [s.strip() for s in script.split(";") if s.strip()]:
+                cur.execute(stmt)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         return cur
 
 
@@ -138,8 +160,28 @@ def close_db(_error):
         db.close()
 
 
+def _safe_add_column(db, table: str, column: str, coltype: str):
+    cols = _table_columns(db, table)
+    if column in cols:
+        return
+    try:
+        if db.backend == "postgres":
+            db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}")
+        else:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        db.commit()
+    except Exception:
+        db.rollback()
+        # Başka worker eklemiş olabilir; tekrar kontrol
+        if column not in _table_columns(db, table):
+            raise
+
+
 def init_db():
+    global _SCHEMA_READY
     db = get_db()
+    if _SCHEMA_READY:
+        return
     if db.backend == "postgres":
         db.executescript(
             """
@@ -317,159 +359,174 @@ def init_db():
         )
     db.commit()
     _migrate_schema(db)
+    _SCHEMA_READY = True
 
 
 def _table_columns(db, table: str) -> list[str]:
     if db.backend == "postgres":
-        cur = db.execute(
-            """
-            SELECT column_name FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = ?
-            """,
-            (table,),
-        )
-        return [r["column_name"] for r in cur.fetchall()]
+        try:
+            cur = db.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = ?
+                """,
+                (table,),
+            )
+            return [r["column_name"] for r in cur.fetchall()]
+        except Exception:
+            db.rollback()
+            return []
     return [r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
 
 
 def _migrate_schema(db):
-    bcols = _table_columns(db, "branches")
-    if "allowed_ip" not in bcols:
-        db.execute("ALTER TABLE branches ADD COLUMN allowed_ip TEXT")
-        db.commit()
-    if "active" not in bcols:
-        db.execute("ALTER TABLE branches ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-        db.commit()
-    db.execute("UPDATE branches SET active = 1 WHERE active IS NULL")
-    db.commit()
+    try:
+        _safe_add_column(db, "branches", "allowed_ip", "TEXT")
+        _safe_add_column(db, "branches", "active", "INTEGER NOT NULL DEFAULT 1")
+        try:
+            db.execute("UPDATE branches SET active = 1 WHERE active IS NULL")
+            db.commit()
+        except Exception:
+            db.rollback()
 
-    pcols = _table_columns(db, "personnel")
-    if "employee_code" not in pcols:
-        db.execute("ALTER TABLE personnel ADD COLUMN employee_code TEXT")
-        db.commit()
-    if "code_confirmed" not in pcols:
-        db.execute("ALTER TABLE personnel ADD COLUMN code_confirmed INTEGER NOT NULL DEFAULT 0")
-        db.commit()
+        _safe_add_column(db, "personnel", "employee_code", "TEXT")
+        _safe_add_column(db, "personnel", "code_confirmed", "INTEGER NOT NULL DEFAULT 0")
+        _safe_add_column(db, "attendance", "auto_closed", "INTEGER NOT NULL DEFAULT 0")
 
-    acols = _table_columns(db, "attendance")
-    if "auto_closed" not in acols:
-        db.execute("ALTER TABLE attendance ADD COLUMN auto_closed INTEGER NOT NULL DEFAULT 0")
-        db.commit()
-    db.execute(
-        """
-        UPDATE attendance SET auto_closed = 1
-        WHERE source = 'auto' AND (auto_closed IS NULL OR auto_closed = 0)
-        """
-    )
-    db.commit()
+        try:
+            db.execute(
+                """
+                UPDATE attendance SET auto_closed = 1
+                WHERE source = 'auto' AND (auto_closed IS NULL OR auto_closed = 0)
+                """
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
 
-    # Yeni tablolar CREATE IF NOT EXISTS ile init_db'de; eski DB için de güvence:
-    if db.backend == "postgres":
-        db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS personnel_leaves (
-                id SERIAL PRIMARY KEY,
-                personnel_id INTEGER NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                leave_type TEXT NOT NULL,
-                note TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS branch_holidays (
-                id SERIAL PRIMARY KEY,
-                branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                title TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id SERIAL PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                action TEXT NOT NULL,
-                detail TEXT
-            );
-            """
-        )
-    else:
-        db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS personnel_leaves (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                personnel_id INTEGER NOT NULL,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                leave_type TEXT NOT NULL,
-                note TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (personnel_id) REFERENCES personnel(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS branch_holidays (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                branch_id INTEGER NOT NULL,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                title TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                action TEXT NOT NULL,
-                detail TEXT
-            );
-            """
-        )
+        # Ek tablolar (CREATE IF NOT EXISTS)
+        if db.backend == "postgres":
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS personnel_leaves (
+                    id SERIAL PRIMARY KEY,
+                    personnel_id INTEGER NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    leave_type TEXT NOT NULL,
+                    note TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS branch_holidays (
+                    id SERIAL PRIMARY KEY,
+                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    title TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id SERIAL PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    detail TEXT
+                );
+                """
+            )
+        else:
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS personnel_leaves (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    personnel_id INTEGER NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    leave_type TEXT NOT NULL,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (personnel_id) REFERENCES personnel(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS branch_holidays (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    branch_id INTEGER NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    title TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    detail TEXT
+                );
+                """
+            )
 
-    # Benzersiz isimlere geçici kod önermesi YOK; sadece tekil isimlere otomatik kod.
-    # Aynı isimli kişiler manuel eşleştirme ekranında kod alır (otomatik varsayım yok).
-    people = db.execute(
-        "SELECT id, full_name, employee_code, code_confirmed FROM personnel ORDER BY id"
-    ).fetchall()
-    by_name: dict[str, list] = {}
-    for p in people:
-        key = (p["full_name"] or "").strip().casefold()
-        by_name.setdefault(key, []).append(p)
-    used = {
-        (p["employee_code"] or "").strip().upper()
-        for p in people
-        if (p["employee_code"] or "").strip()
-    }
-    next_n = 1
-    for key, group in by_name.items():
-        if len(group) != 1:
-            continue
-        p = group[0]
-        if (p["employee_code"] or "").strip():
-            if not int(p["code_confirmed"] or 0):
-                db.execute(
-                    "UPDATE personnel SET code_confirmed = 1 WHERE id = ?",
-                    (p["id"],),
-                )
-            continue
-        while f"P{next_n:04d}" in used:
+        # Tekil isimlere otomatik kod (aynı isimler elle)
+        people = db.execute(
+            "SELECT id, full_name, employee_code, code_confirmed FROM personnel ORDER BY id"
+        ).fetchall()
+        by_name: dict[str, list] = {}
+        for p in people:
+            key = (p["full_name"] or "").strip().casefold()
+            by_name.setdefault(key, []).append(p)
+        used = {
+            (p["employee_code"] or "").strip().upper()
+            for p in people
+            if (p["employee_code"] or "").strip()
+        }
+        next_n = 1
+        for _key, group in by_name.items():
+            if len(group) != 1:
+                continue
+            p = group[0]
+            if (p["employee_code"] or "").strip():
+                if not int(p["code_confirmed"] or 0):
+                    try:
+                        db.execute(
+                            "UPDATE personnel SET code_confirmed = 1 WHERE id = ?",
+                            (p["id"],),
+                        )
+                    except Exception:
+                        db.rollback()
+                continue
+            while f"P{next_n:04d}" in used:
+                next_n += 1
+            code = f"P{next_n:04d}"
+            used.add(code)
             next_n += 1
-        code = f"P{next_n:04d}"
-        used.add(code)
-        next_n += 1
-        db.execute(
-            "UPDATE personnel SET employee_code = ?, code_confirmed = 1 WHERE id = ?",
-            (code, p["id"]),
-        )
-    db.commit()
+            try:
+                db.execute(
+                    "UPDATE personnel SET employee_code = ?, code_confirmed = 1 WHERE id = ?",
+                    (code, p["id"]),
+                )
+            except Exception:
+                db.rollback()
+                used.discard(code)
+        db.commit()
+    except Exception:
+        db.rollback()
+        app.logger.exception("schema migration failed")
+        raise
 
 
 @app.before_request
 def before_request():
-    init_db()
+    try:
+        init_db()
+    except Exception:
+        app.logger.exception("init_db failed")
+        # health hariç diğer isteklerde hata görünsün diye yeniden fırlatma;
+        # health DB'siz de cevap versin diye endpoint'te ayrı kontrol var
+        if (request.endpoint or "") != "health":
+            raise
     ep = request.endpoint or ""
     if ep == "static":
         return None
-    # Admin oturum zaman aşımı
     if session.get("is_admin") and ep not in ("index", "logout", "health"):
         last = session.get("admin_last_active")
         now_ts = time.time()
@@ -480,10 +537,21 @@ def before_request():
         session["admin_last_active"] = now_ts
         session.modified = True
     try:
-        auto_close_stale_checkouts(get_db())
+        if ep != "health":
+            auto_close_stale_checkouts(get_db())
     except Exception:
         app.logger.exception("auto_close_stale_checkouts")
     return None
+
+
+@app.errorhandler(500)
+def handle_500(err):
+    app.logger.exception("internal_server_error: %s", err)
+    return (
+        "<h1>Internal Server Error</h1>"
+        "<p>Sunucu hatası. Render → Logs sekmesinden kırmızı satırlara bakın.</p>",
+        500,
+    )
 
 
 def require_admin():
@@ -1709,8 +1777,14 @@ def personel():
 
 @app.get("/health")
 def health():
-    """Render / denetim: tarayıcıda /health açınca 'ok' görünmeli."""
-    return Response("ok", mimetype="text/plain")
+    """Render / denetim: tarayıcıda /health açınca durum görünmeli."""
+    try:
+        db = get_db()
+        db.execute("SELECT 1 AS ok").fetchone()
+        return Response("ok", mimetype="text/plain")
+    except Exception as exc:
+        app.logger.exception("health_db_failed")
+        return Response(f"db_error: {exc}", status=503, mimetype="text/plain")
 
 
 @app.route("/tara")
