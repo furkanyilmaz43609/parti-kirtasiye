@@ -1845,11 +1845,32 @@ def diag():
             lines.append(f"today_summary ERROR: {e}")
             lines.append(traceback.format_exc())
         try:
+            att = db.execute(
+                """
+                SELECT a.*, p.full_name, p.employee_code, b.name AS branch_name
+                FROM attendance a
+                JOIN personnel p ON p.id = a.personnel_id
+                JOIN branches b ON b.id = a.branch_id
+                ORDER BY COALESCE(a.checkout_at, a.checkin_at) DESC, a.id DESC
+                LIMIT 50
+                """
+            ).fetchall()
+            lines.append(f"attendance_sample={len(att)}")
+            if att:
+                r0 = att[0]
+                lines.append(
+                    f"att0 keys auto_closed={r0.get('auto_closed') if hasattr(r0,'get') else r0['auto_closed']} source={r0['source']}"
+                )
+        except Exception as e:
+            att = []
+            lines.append(f"attendance_query ERROR: {e}")
+            lines.append(traceback.format_exc())
+        try:
             html = render_template(
                 "admin.html",
                 branches=fetch_branches(active_only=False),
                 personnel=fetch_personnel_admin(),
-                attendance_rows=[],
+                attendance_rows=att,
                 latest_notes=[],
                 today_summary=summary,
                 selected_pid=None,
@@ -1871,7 +1892,7 @@ def diag():
                 branch_filter=None,
                 page=1,
                 total_pages=1,
-                total_att=0,
+                total_att=len(att),
                 min_password_len=MIN_PASSWORD_LEN,
             )
             lines.append(f"admin_template_render: ok len={len(html)}")
