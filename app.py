@@ -516,18 +516,22 @@ def _migrate_schema(db):
 
 @app.before_request
 def before_request():
+    ep = request.endpoint or ""
+    if ep in ("static", "diag", "health"):
+        if ep == "static":
+            return None
+        # diag/health: init hata verse bile endpoint kendi yakalasın
+        try:
+            init_db()
+        except Exception:
+            app.logger.exception("init_db failed (diag/health)")
+        return None
     try:
         init_db()
     except Exception:
         app.logger.exception("init_db failed")
-        # health hariç diğer isteklerde hata görünsün diye yeniden fırlatma;
-        # health DB'siz de cevap versin diye endpoint'te ayrı kontrol var
-        if (request.endpoint or "") != "health":
-            raise
-    ep = request.endpoint or ""
-    if ep == "static":
-        return None
-    if session.get("is_admin") and ep not in ("index", "logout", "health"):
+        raise
+    if session.get("is_admin") and ep not in ("index", "logout"):
         last = session.get("admin_last_active")
         now_ts = time.time()
         if last is not None and (now_ts - float(last)) > ADMIN_SESSION_IDLE_SEC:
@@ -537,8 +541,7 @@ def before_request():
         session["admin_last_active"] = now_ts
         session.modified = True
     try:
-        if ep != "health":
-            auto_close_stale_checkouts(get_db())
+        auto_close_stale_checkouts(get_db())
     except Exception:
         app.logger.exception("auto_close_stale_checkouts")
     return None
@@ -1785,6 +1788,82 @@ def health():
     except Exception as exc:
         app.logger.exception("health_db_failed")
         return Response(f"db_error: {exc}", status=503, mimetype="text/plain")
+
+
+@app.get("/diag")
+def diag():
+    """Geçici teşhis — hata metnini düz yazı döner. Sorun çözülünce kaldırılacak."""
+    import traceback
+
+    lines = []
+    try:
+        init_db()
+        lines.append("init_db: ok")
+        db = get_db()
+        lines.append(f"backend: {db.backend}")
+        for t in (
+            "branches",
+            "personnel",
+            "attendance",
+            "personnel_leaves",
+            "branch_holidays",
+            "audit_log",
+            "settings",
+        ):
+            try:
+                n = db.execute(f"SELECT COUNT(*) AS c FROM {t}").fetchone()["c"]
+                cols = ", ".join(_table_columns(db, t)[:20])
+                lines.append(f"table {t}: rows={n} cols=[{cols}]")
+            except Exception as e:
+                db.rollback()
+                lines.append(f"table {t}: ERROR {e}")
+        needing, dups = personnel_needing_manual_codes(db)
+        lines.append(f"needing_codes={len(needing)} dup_groups={len(dups)}")
+        summary = fetch_today_dashboard_summary(db)
+        lines.append(
+            f"today_summary: inside={summary['inside_count']} missing={len(summary['missing_today'])}"
+        )
+        from datetime import date as _date
+
+        today = now_tr().date()
+        rows = period_missing_report(db, today.replace(day=1), today)
+        lines.append(f"period_report_rows={len(rows)}")
+        # admin template smoke: render without login context vars minimally
+        html = render_template(
+            "admin.html",
+            branches=fetch_branches(active_only=False),
+            personnel=fetch_personnel_admin(),
+            attendance_rows=[],
+            latest_notes=[],
+            today_summary=summary,
+            selected_pid=None,
+            sel_name=None,
+            sel_code=None,
+            sel_stats=None,
+            sel_range_stats=None,
+            selected_start="",
+            selected_end="",
+            sel_leaves=[],
+            leave_types=LEAVE_TYPES,
+            leave_type_labels=LEAVE_TYPE_LABELS,
+            holidays=[],
+            audit_rows=[],
+            needing_codes=needing,
+            dup_groups=dups,
+            suggested_code=next_employee_code(db),
+            q="",
+            branch_filter=None,
+            page=1,
+            total_pages=1,
+            total_att=0,
+            min_password_len=MIN_PASSWORD_LEN,
+        )
+        lines.append(f"admin_template_render: ok len={len(html)}")
+        lines.append("ALL_OK")
+    except Exception:
+        lines.append("FAIL")
+        lines.append(traceback.format_exc())
+    return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
 
 
 @app.route("/tara")
