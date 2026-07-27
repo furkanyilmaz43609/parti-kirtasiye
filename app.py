@@ -84,7 +84,13 @@ if _RENDER_HOSTED:
 
 def redirect_after_admin_login(request_next: str):
     target = (request_next or "").strip()
-    if target.startswith("/") and not target.startswith("//") and "\r" not in target and "\n" not in target:
+    if (
+        target.startswith("/")
+        and not target.startswith("//")
+        and "\r" not in target
+        and "\n" not in target
+        and (target == "/admin" or target.startswith("/admin?") or target.startswith("/admin/"))
+    ):
         return redirect(target)
     return redirect(url_for("admin"))
 
@@ -1053,6 +1059,78 @@ def branch_shift_moment_on_day_tr(day_str: str, hhmm: str | None, default_hhmm: 
         return None
 
 
+def missing_today_batch(db, today_d):
+    """Bugünkü eksik süre listesi — tek seferde toplu sorgu (admin hızlı açılsın)."""
+    today_s = today_d.strftime("%Y-%m-%d")
+    now = now_tr()
+    people = db.execute(
+        """
+        SELECT p.id AS personnel_id, p.full_name, p.employee_code, p.branch_id,
+               b.name AS branch_name, b.shift_start, b.shift_end
+        FROM personnel p
+        JOIN branches b ON b.id = p.branch_id
+        WHERE p.active = 1
+        """
+    ).fetchall()
+    leave_pids = {
+        int(r["personnel_id"])
+        for r in db.execute(
+            "SELECT personnel_id FROM personnel_leaves WHERE start_date <= ? AND end_date >= ?",
+            (today_s, today_s),
+        ).fetchall()
+    }
+    holiday_branches = {
+        int(r["branch_id"])
+        for r in db.execute(
+            "SELECT branch_id FROM branch_holidays WHERE start_date <= ? AND end_date >= ?",
+            (today_s, today_s),
+        ).fetchall()
+    }
+    actual_by_pid: dict[int, int] = {}
+    for r in db.execute(
+        """
+        SELECT personnel_id, date, checkin_at, checkout_at, duration_minutes, source, auto_closed
+        FROM attendance WHERE date = ?
+        """,
+        (today_s,),
+    ).fetchall():
+        pid = int(r["personnel_id"])
+        actual_by_pid[pid] = actual_by_pid.get(pid, 0) + minutes_from_attendance_row(
+            r,
+            today_s=today_s,
+            now=now,
+            parse_ts_tr=_parse_ts_tr,
+            minutes_between=_minutes_between,
+        )
+    out = []
+    for p in people:
+        pid = int(p["personnel_id"])
+        bid = int(p["branch_id"])
+        if pid in leave_pids or bid in holiday_branches:
+            continue
+        miss = missing_minutes_for_day(
+            day_s=today_s,
+            shift_start=p["shift_start"],
+            shift_end=p["shift_end"],
+            is_leave=False,
+            actual_minutes=actual_by_pid.get(pid, 0),
+        )
+        if miss and miss > 0:
+            out.append(
+                {
+                    "personnel_id": pid,
+                    "full_name": p["full_name"],
+                    "employee_code": p["employee_code"] or "",
+                    "branch_name": p["branch_name"],
+                    "label": person_label(p),
+                    "missing_minutes": miss,
+                    "missing_hm": format_duration_tr(miss),
+                }
+            )
+    out.sort(key=lambda x: (-x["missing_minutes"], x["label"].lower()))
+    return out
+
+
 def fetch_today_dashboard_summary(db):
     """Bugün: içeridekiler + eksik saat odaklı özet (geç kalma eksik süreye dahildir)."""
     now = now_tr()
@@ -1097,16 +1175,7 @@ def fetch_today_dashboard_summary(db):
             )
 
     # Bugün eksik süresi > 0 olan personeller (izinli değil)
-    missing_today = []
-    for p in fetch_personnel_admin():
-        if not int(p["active"] or 0):
-            continue
-        st = personnel_missing_stats(db, int(p["id"]), today_d, today_d)
-        if not st or st["leave_days"]:
-            continue
-        if st["missing_minutes"] > 0:
-            missing_today.append(st)
-    missing_today.sort(key=lambda x: -x["missing_minutes"])
+    missing_today = missing_today_batch(db, today_d)
 
     return {
         "date_label": format_iso_date_tr(today_s),
@@ -1191,6 +1260,7 @@ def index():
             else:
                 set_setting("admin_password_hash", hash_password(password))
                 session["is_admin"] = True
+                session.permanent = True
                 session["admin_last_active"] = time.time()
                 write_audit(get_db(), "admin_password_setup", "İlk şifre belirlendi")
                 return redirect_after_admin_login(next_url)
@@ -1199,6 +1269,7 @@ def index():
             password = request.form.get("password", "").strip()
             if verify_password(password):
                 session["is_admin"] = True
+                session.permanent = True
                 session["admin_last_active"] = time.time()
                 return redirect_after_admin_login(next_url)
             flash("Yönetici şifresi hatalı.", "danger")
@@ -1526,21 +1597,33 @@ def _admin_impl():
         JOIN branches b ON b.id = a.branch_id
         WHERE 1=1
     """
+    count_q = """
+        SELECT COUNT(*) AS c
+        FROM attendance a
+        JOIN personnel p ON p.id = a.personnel_id
+        JOIN branches b ON b.id = a.branch_id
+        WHERE 1=1
+    """
     params: list = []
+    filter_sql = ""
     if branch_filter:
-        attendance_q += " AND a.branch_id = ?"
+        filter_sql += " AND a.branch_id = ?"
         params.append(branch_filter)
     if q_filter:
-        attendance_q += " AND (LOWER(p.full_name) LIKE ? OR LOWER(COALESCE(p.employee_code,'')) LIKE ? OR LOWER(b.name) LIKE ?)"
+        filter_sql += " AND (LOWER(p.full_name) LIKE ? OR LOWER(COALESCE(p.employee_code,'')) LIKE ? OR LOWER(b.name) LIKE ?)"
         like = f"%{q_filter}%"
         params.extend([like, like, like])
-    attendance_q += " ORDER BY COALESCE(a.checkout_at, a.checkin_at) DESC, a.id DESC"
-
-    all_att = db.execute(attendance_q, tuple(params)).fetchall()
-    total_att = len(all_att)
+    count_row = db.execute(count_q + filter_sql, tuple(params)).fetchone()
+    total_att = int(count_row["c"] or 0) if count_row else 0
     total_pages = max(1, (total_att + per_page - 1) // per_page)
     page = min(page, total_pages)
-    attendance_rows = all_att[(page - 1) * per_page : page * per_page]
+    list_params = list(params) + [per_page, (page - 1) * per_page]
+    attendance_rows = db.execute(
+        attendance_q
+        + filter_sql
+        + " ORDER BY COALESCE(a.checkout_at, a.checkin_at) DESC, a.id DESC LIMIT ? OFFSET ?",
+        tuple(list_params),
+    ).fetchall()
 
     personnel_filtered = personnel_admin
     if q_filter:
