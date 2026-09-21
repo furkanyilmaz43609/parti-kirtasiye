@@ -1132,10 +1132,9 @@ def missing_today_batch(db, today_d):
 
 
 def fetch_today_dashboard_summary(db):
-    """Bugün: içeridekiler + eksik saat odaklı özet (geç kalma eksik süreye dahildir)."""
+    """Bugün: içeridekiler, mesaiye geç gelenler, mesai bitmiş hâlâ içeride olanlar."""
     now = now_tr()
     today_s = now.strftime("%Y-%m-%d")
-    today_d = now.date()
 
     inside_rows = db.execute(
         """
@@ -1174,66 +1173,170 @@ def fetch_today_dashboard_summary(db):
                 }
             )
 
-    # Bugün eksik süresi > 0 olan personeller (izinli değil)
-    missing_today = missing_today_batch(db, today_d)
+    cin_rows = db.execute(
+        """
+        SELECT p.id AS personnel_id, p.full_name, p.employee_code, b.name AS branch_name,
+               b.shift_start, a.checkin_at, a.id
+        FROM attendance a
+        JOIN personnel p ON p.id = a.personnel_id
+        JOIN branches b ON b.id = a.branch_id
+        WHERE a.date = ? AND a.checkin_at IS NOT NULL
+        ORDER BY p.id, a.id
+        """,
+        (today_s,),
+    ).fetchall()
+
+    late_arrivals = []
+    seen_pid = set()
+    for r in cin_rows:
+        pid = r["personnel_id"]
+        if pid in seen_pid:
+            continue
+        seen_pid.add(pid)
+        st = branch_shift_moment_on_day_tr(today_s, r["shift_start"], "09:00")
+        ci = _parse_ts_tr(r["checkin_at"])
+        if st and ci and ci > st:
+            late_min = _minutes_between(st, ci)
+            late_arrivals.append(
+                {
+                    "label": person_label(r),
+                    "branch_name": r["branch_name"],
+                    "checkin_label": format_display_datetime(r["checkin_at"]),
+                    "late_hm": format_duration_tr(late_min),
+                }
+            )
 
     return {
         "date_label": format_iso_date_tr(today_s),
         "inside": inside,
         "inside_count": len(inside),
-        "missing_today": missing_today,
+        "late_arrivals": late_arrivals,
         "past_shift_inside": past_shift_inside,
     }
 
 
 def personnel_work_stats(db, personnel_id: int):
+    """Fiili mağazada kalınan süre: bugün / hafta / ay (otomatik kapananlar hariç)."""
+    rows = db.execute(
+        """
+        SELECT date, checkin_at, checkout_at, duration_minutes, source, auto_closed
+        FROM attendance WHERE personnel_id = ? ORDER BY id
+        """,
+        (personnel_id,),
+    ).fetchall()
+
     now = now_tr()
-    today_d = now.date()
+    today_s = now.strftime("%Y-%m-%d")
     mon_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).date()
-    week_start = today_d - timedelta(days=today_d.weekday())
-    week_end = week_start + timedelta(days=6)
+    week_start_date = now.date() - timedelta(days=now.weekday())
+    week_end_date = week_start_date + timedelta(days=6)
 
-    today_st = personnel_missing_stats(db, personnel_id, today_d, today_d)
-    week_st = personnel_missing_stats(db, personnel_id, week_start, week_end)
-    month_st = personnel_missing_stats(db, personnel_id, mon_start, today_d)
+    prow = db.execute(
+        "SELECT branch_id FROM personnel WHERE id = ?", (personnel_id,)
+    ).fetchone()
+    branch_id = int(prow["branch_id"]) if prow else 0
 
-    def pack(st):
-        if not st:
-            return {
-                "missing_hm": "—",
-                "worked_hm": "—",
-                "leave_days": 0,
-                "missing_minutes": 0,
-            }
-        return st
+    def contrib_minutes_day(iso_day: str) -> int:
+        total = 0
+        for r in rows:
+            if r["date"] != iso_day:
+                continue
+            total += minutes_from_attendance_row(
+                r,
+                today_s=today_s,
+                now=now,
+                parse_ts_tr=_parse_ts_tr,
+                minutes_between=_minutes_between,
+            )
+        return total
 
-    t, w, m = pack(today_st), pack(week_st), pack(month_st)
+    today_minutes = contrib_minutes_day(today_s)
+
+    weekly_minutes = 0
+    weekly_days = set()
+    cur = week_start_date
+    while cur <= week_end_date:
+        iso = cur.strftime("%Y-%m-%d")
+        m = contrib_minutes_day(iso)
+        if m > 0:
+            weekly_minutes += m
+            weekly_days.add(iso)
+        cur += timedelta(days=1)
+
+    monthly_minutes = 0
+    monthly_days = set()
+    leave_days_month = 0
+    cur = mon_start
+    while cur.year == now.year and cur.month == now.month and cur <= now.date():
+        iso = cur.strftime("%Y-%m-%d")
+        if branch_id and is_leave_or_holiday(db, personnel_id, branch_id, iso):
+            leave_days_month += 1
+        m = contrib_minutes_day(iso)
+        if m > 0:
+            monthly_minutes += m
+            monthly_days.add(iso)
+        cur += timedelta(days=1)
+
     return {
-        "today_missing_hm": t["missing_hm"] if t.get("leave_days") == 0 else "İzinli",
-        "today_worked_hm": t.get("worked_hm", "—"),
-        "today_leave": bool(t.get("leave_days")),
-        "week_missing_hm": w["missing_hm"],
-        "week_worked_hm": w.get("worked_hm", "—"),
-        "week_leave_days": w.get("leave_days", 0),
-        "month_missing_hm": m["missing_hm"],
-        "month_worked_hm": m.get("worked_hm", "—"),
-        "month_leave_days": m.get("leave_days", 0),
-        "leave_days_month": m.get("leave_days", 0),
+        "today_hm": format_duration_tr(today_minutes),
+        "week_days": len(weekly_days),
+        "week_hm": format_duration_tr(weekly_minutes),
+        "month_days": len(monthly_days),
+        "month_hm": format_duration_tr(monthly_minutes),
+        "leave_days_month": leave_days_month,
     }
 
 
 def personnel_work_stats_range(db, personnel_id: int, start_date, end_date):
-    st = personnel_missing_stats(db, personnel_id, start_date, end_date)
-    if not st:
-        return None
+    """Seçilen aralıkta fiili çalışma süresi."""
+    rows = db.execute(
+        """
+        SELECT date, checkin_at, checkout_at, duration_minutes, source, auto_closed
+        FROM attendance
+        WHERE personnel_id = ? AND date >= ? AND date <= ?
+        ORDER BY id
+        """,
+        (personnel_id, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
+    ).fetchall()
+
+    now = now_tr()
+    today_s = now.strftime("%Y-%m-%d")
+    total_minutes = 0
+    worked_days = set()
+    auto_closed_days = set()
+
+    prow = db.execute(
+        "SELECT branch_id FROM personnel WHERE id = ?", (personnel_id,)
+    ).fetchone()
+    branch_id = int(prow["branch_id"]) if prow else 0
+    leave_days = 0
+    for d in iter_dates(start_date, end_date):
+        iso = d.strftime("%Y-%m-%d")
+        if branch_id and is_leave_or_holiday(db, personnel_id, branch_id, iso):
+            leave_days += 1
+
+    for row in rows:
+        if not attendance_counts_as_work(row):
+            auto_closed_days.add(row["date"])
+            continue
+        minutes = minutes_from_attendance_row(
+            row,
+            today_s=today_s,
+            now=now,
+            parse_ts_tr=_parse_ts_tr,
+            minutes_between=_minutes_between,
+        )
+        if minutes > 0:
+            total_minutes += minutes
+            worked_days.add(row["date"])
+
     return {
-        "range_missing_hm": st["missing_hm"],
-        "range_worked_hm": st["worked_hm"],
-        "range_leave_days": st["leave_days"],
-        "range_days": st["counted_days"],
+        "range_days": len(worked_days),
+        "range_hm": format_duration_tr(total_minutes),
+        "range_leave_days": leave_days,
         "start_label": format_iso_date_tr(start_date.strftime("%Y-%m-%d")),
         "end_label": format_iso_date_tr(end_date.strftime("%Y-%m-%d")),
-        "auto_closed_days": st["auto_closed_days"],
+        "auto_closed_days": len(auto_closed_days),
     }
 
 
@@ -1884,7 +1987,7 @@ def diag():
         "date_label": "-",
         "inside": [],
         "inside_count": 0,
-        "missing_today": [],
+        "late_arrivals": [],
         "past_shift_inside": [],
     }
     try:
@@ -1922,7 +2025,7 @@ def diag():
         try:
             summary = fetch_today_dashboard_summary(db)
             lines.append(
-                f"today_summary: inside={summary['inside_count']} missing={len(summary['missing_today'])}"
+                f"today_summary: inside={summary['inside_count']} late={len(summary.get('late_arrivals') or [])}"
             )
         except Exception as e:
             lines.append(f"today_summary ERROR: {e}")

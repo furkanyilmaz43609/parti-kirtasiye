@@ -45,7 +45,7 @@
             <span class="small text-secondary text-nowrap" id="tr-clock" title="Europe/Istanbul"></span>
         </div>
         <div class="d-flex gap-2 flex-wrap">
-            <a class="btn btn-sm btn-warning" href="{{ url_for('admin_missing_hours') }}">Eksik saat raporu</a>
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('admin_missing_hours') }}">Eksik saat (opsiyonel)</a>
             <a class="btn btn-sm btn-outline-warning" href="{{ url_for('admin_personnel_codes') }}">Personel kodları</a>
             <a class="btn btn-sm btn-outline-light" href="/personel" target="_blank">Personel ekranı</a>
             <a class="btn btn-sm btn-outline-light" href="/rapor/excel">Mesai CSV</a>
@@ -229,7 +229,7 @@
                 <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
                     <div>
                         <div class="section-title">Bugünkü özet</div>
-                        <div class="text-secondary small mt-1">{{ today_summary.date_label }} · ana metrik: eksik süre</div>
+                        <div class="text-secondary small mt-1">{{ today_summary.date_label }} · ana metrik: mağazada kalınan süre</div>
                     </div>
                     <button type="button" class="btn btn-sm btn-outline-light" onclick="location.reload()">Yenile</button>
                 </div>
@@ -246,13 +246,13 @@
                         </div>
                     </div>
                     <div class="col-md-4">
-                        <div class="stat-box emphasis h-100">
-                            <div class="text-secondary small">Bugün eksik süresi olanlar</div>
-                            <div class="fs-6 fw-semibold mt-1">{{ today_summary.missing_today|length }} kişi</div>
+                        <div class="stat-box h-100">
+                            <div class="text-secondary small">Mesai başına geç gelenler</div>
+                            <div class="fs-6 fw-semibold mt-1">{{ today_summary.late_arrivals|length }} kişi</div>
                             <ul class="small mt-2 mb-0 ps-3">
-                                {% for x in today_summary.missing_today[:12] %}
-                                <li class="mb-1">{{ x.label }} · <strong>{{ x.missing_hm }}</strong></li>
-                                {% else %}<li class="text-secondary">Yok / herkes izinli veya tamam</li>{% endfor %}
+                                {% for x in today_summary.late_arrivals[:12] %}
+                                <li class="mb-1">{{ x.label }} · {{ x.late_hm }} geç</li>
+                                {% else %}<li class="text-secondary">Yok</li>{% endfor %}
                             </ul>
                         </div>
                     </div>
@@ -274,7 +274,7 @@
             <div class="card-s p-4 mb-4">
                 <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
                     <div>
-                        <div class="section-title">Seçilen personel</div>
+                        <div class="section-title">Seçilen personel · mağazada kalınan süre</div>
                         <div class="h5 mb-0 mt-1"><span class="code-pill">{{ sel_code or '—' }}</span> {{ sel_name }}</div>
                     </div>
                     <a href="{{ url_for('admin') }}" class="small text-secondary">Temizle</a>
@@ -295,37 +295,40 @@
                 </form>
                 <div class="row g-3 mt-2">
                     <div class="col-md-4">
-                        <div class="stat-box emphasis">
-                            <div class="text-secondary small">Bugün eksik</div>
-                            <div class="fs-5 fw-semibold mt-1">{{ sel_stats.today_missing_hm }}</div>
-                            <div class="small text-secondary mt-1">Fiili: {{ sel_stats.today_worked_hm }}</div>
+                        <div class="stat-box">
+                            <div class="text-secondary small">Bugün</div>
+                            <div class="fs-5 fw-semibold mt-1">{{ sel_stats.today_hm }}</div>
                         </div>
                     </div>
                     <div class="col-md-4">
-                        <div class="stat-box emphasis">
-                            <div class="text-secondary small">Bu hafta eksik</div>
-                            <div class="fs-6 fw-semibold mt-1">{{ sel_stats.week_missing_hm }}</div>
-                            <div class="small text-secondary mt-1">İzin: {{ sel_stats.week_leave_days }} gün · Fiili {{ sel_stats.week_worked_hm }}</div>
+                        <div class="stat-box">
+                            <div class="text-secondary small">Bu hafta (Pzt–Paz)</div>
+                            <div class="fs-6 fw-semibold mt-1">{{ sel_stats.week_days }} gün</div>
+                            <div class="mt-1">{{ sel_stats.week_hm }}</div>
                         </div>
                     </div>
                     <div class="col-md-4">
-                        <div class="stat-box emphasis">
-                            <div class="text-secondary small">Bu ay eksik</div>
-                            <div class="fs-6 fw-semibold mt-1">{{ sel_stats.month_missing_hm }}</div>
-                            <div class="small text-secondary mt-1">İzinli/tatil günleri: {{ sel_stats.month_leave_days }} gün</div>
+                        <div class="stat-box">
+                            <div class="text-secondary small">Bu ay</div>
+                            <div class="fs-6 fw-semibold mt-1">{{ sel_stats.month_days }} gün</div>
+                            <div class="mt-1">{{ sel_stats.month_hm }}</div>
+                            {% if sel_stats.leave_days_month %}
+                            <div class="small text-secondary mt-1">İzinli/tatil: {{ sel_stats.leave_days_month }} gün</div>
+                            {% endif %}
                         </div>
                     </div>
                 </div>
                 {% if sel_range_stats %}
-                <div class="stat-box emphasis mt-3">
-                    <div class="text-secondary small">Seçilen aralık eksik ({{ sel_range_stats.start_label }} – {{ sel_range_stats.end_label }})</div>
-                    <div class="fs-5 fw-semibold mt-1">{{ sel_range_stats.range_missing_hm }}</div>
-                    <div class="small mt-1">Fiili {{ sel_range_stats.range_worked_hm }} · İzin {{ sel_range_stats.range_leave_days }} gün · Hesaplanan {{ sel_range_stats.range_days }} gün</div>
+                <div class="stat-box mt-3">
+                    <div class="text-secondary small">Seçilen aralık ({{ sel_range_stats.start_label }} – {{ sel_range_stats.end_label }})</div>
+                    <div class="fs-5 fw-semibold mt-1">{{ sel_range_stats.range_hm }}</div>
+                    <div class="small mt-1">{{ sel_range_stats.range_days }} gün çalışıldı{% if sel_range_stats.range_leave_days %} · {{ sel_range_stats.range_leave_days }} gün izin/tatil{% endif %}</div>
                     {% if sel_range_stats.auto_closed_days %}
-                    <div class="small text-warning mt-1">⚠ {{ sel_range_stats.auto_closed_days }} günde otomatik kapanmış kayıt var (süre hesaba dahil edilmedi).</div>
+                    <div class="small text-warning mt-1">⚠ {{ sel_range_stats.auto_closed_days }} günde otomatik kapanmış kayıt var (süreye dahil edilmedi).</div>
                     {% endif %}
                 </div>
                 {% endif %}
+                <p class="small text-secondary mt-3 mb-0">Süreler giriş–çıkış arasındaki gerçek mağazada kalma süresidir (otomatik kapananlar hariç).</p>
 
                 <div class="mt-4">
                     <div class="section-title mb-2">İzin / tatil ata</div>
@@ -358,7 +361,7 @@
             </div>
             {% else %}
             <div class="card-s p-4 mb-4 text-secondary small">
-                Soldan personel seçin (kod ile). Tüm personel için dönemsel eksik saat: <a href="{{ url_for('admin_missing_hours') }}">Eksik saat raporu</a>.
+                Soldan personel seçin; bugün / hafta / ay <strong>mağazada kalınan süre</strong> burada görünür.
             </div>
             {% endif %}
 
