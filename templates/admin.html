@@ -35,6 +35,17 @@
         tr.row-auto { background: rgba(196, 122, 42, .18) !important; color: #f0c090; }
         .badge-auto { background: #5c3a12; color: #ffc978; border: 1px solid #c47a2a; font-weight: 500; }
         .code-pill { font-family: ui-monospace, monospace; color: #9fd4bd; }
+        .live-scroll {
+            max-height: min(72vh, 720px);
+            overflow-y: auto;
+            overflow-x: auto;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+        }
+        .live-scroll::-webkit-scrollbar { width: 12px; height: 12px; }
+        .live-scroll::-webkit-scrollbar-track { background: #0a0d12; }
+        .live-scroll::-webkit-scrollbar-thumb { background: #5a6574; border-radius: 8px; }
+        .live-scroll::-webkit-scrollbar-thumb:hover { background: #7a8594; }
     </style>
 </head>
 <body>
@@ -378,7 +389,7 @@
                         <button class="btn btn-sm btn-outline-light" type="submit">Filtrele</button>
                     </form>
                 </div>
-                <div class="table-responsive mt-3 rounded-2 overflow-hidden" style="max-height:min(70vh,640px)">
+                <div class="live-scroll mt-3">
                     <table class="table table-sm compact table-darkish mb-0">
                         <thead class="sticky-top sticky-head border-bottom border-secondary"><tr>
                             <th>Kod</th><th>İsim</th><th>Mağaza</th><th>Tarih</th><th>Giriş</th><th>Çıkış</th><th>Süre</th><th></th>
